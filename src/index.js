@@ -6,6 +6,7 @@ import {
   startWhatsApp,
   stopWhatsApp,
 } from './services/baileysService.js';
+import { getModelInfo } from './services/geminiService.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -17,6 +18,7 @@ app.get('/health', (_req, res) => {
     service: 'whatsapp-gemini-chatbot',
     whatsapp: getConnectionStatus(),
     authStorage: getAuthStorageMode(),
+    model: getModelInfo(),
     timestamp: new Date().toISOString(),
   });
 });

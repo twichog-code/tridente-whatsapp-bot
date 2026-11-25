@@ -1,22 +1,30 @@
 import { GoogleGenAI } from '@google/genai';
 
-const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
+const DEFAULT_MODEL = 'gemini-3-flash-preview';
 const FALLBACK_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-3.8-flash',
   'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
-  'gemini-3-flash-preview',
   'gemma-4-26b-a4b-it',
   'gemma-4-31b-it',
-  'gemini-3.8-flash',
   'gemini-4-hydrogen',
 ];
-const REQUEST_TIMEOUT_MS = 12000;
+const REQUEST_TIMEOUT_MS = 14000;
 const COOLDOWN_429_MS = 10 * 60 * 1000; // 10 min si excede cuota/rate limit
 const COOLDOWN_503_MS = 60 * 1000; // 1 min si hay saturación temporal o timeout
-const DEFAULT_SYSTEM_INSTRUCTION =
-  'Eres un asistente virtual amable, claro y conciso que responde mensajes por WhatsApp en español. ' +
-  'Mantén tus respuestas breves, útiles y fáciles de leer en un teléfono móvil.';
-const MAX_HISTORY_MESSAGES = 10;
+const DEFAULT_SYSTEM_INSTRUCTION = [
+  'Eres Tridente, un asistente de IA con personalidad propia que conversa por WhatsApp en español natural.',
+  'Personalidad: eres agudo, ingenioso, cercano y directo — como ese amigo brillante que siempre tiene una buena respuesta, sabe de tecnología, cultura y vida cotidiana, y habla con soltura sin sonar robótico.',
+  'Reglas de estilo:',
+  '- Ve directo al grano con respuestas inteligentes, útiles y con criterio propio.',
+  '- Adapta tu tono al usuario: relajado y con un toque de humor/chispa en charlas casuales; preciso, claro y bien estructurado en temas técnicos, trabajo o decisiones serias.',
+  '- NUNCA uses frases acartonadas ni repetitivas como "¡Claro que sí!", "¡Por supuesto!", "Como asistente virtual..." ni cierres cada mensaje con "¿En qué más te puedo ayudar hoy? 😊".',
+  '- No te presentes en cada mensaje; solo di tu nombre si te preguntan quién eres o en un primer saludo natural.',
+  '- Formato optimizado para WhatsApp: párrafos breves, *negritas* (un solo asterisco) y listas cortas cuando ayuden. Usa emojis con moderación, solo cuando sumen.',
+  '- Aprovecha la memoria de la conversación para mantener continuidad y recordar lo que ya hablaron.',
+].join('\n');
+const MAX_HISTORY_MESSAGES = 20;
 
 // Memoria de conversación en memoria: Map<phoneNumber, Array<InteractionStep>>
 const conversationStore = new Map();
@@ -25,6 +33,7 @@ const modelCooldownUntil = new Map();
 
 let aiClient = null;
 let configuredSystemInstruction = null;
+let lastUsedModel = null;
 
 /**
  * Inicializa (de forma perezosa) el cliente oficial de Google GenAI.
@@ -38,9 +47,20 @@ function getClient() {
         'Falta la variable de entorno GEMINI_API_KEY. Configúrala en tu archivo .env.'
       );
     }
-    aiClient = new GoogleGenAI({ apiKey });
+    aiClient = new GoogleGenAI({ apiKey, apiVersion: 'v1beta' });
   }
   return aiClient;
+}
+
+/**
+ * Devuelve el modelo principal configurado y el último modelo que respondió exitosamente.
+ * @returns {{ configured: string, lastUsed: string | null }}
+ */
+export function getModelInfo() {
+  return {
+    configured: process.env.GEMINI_MODEL || DEFAULT_MODEL,
+    lastUsed: lastUsedModel,
+  };
 }
 
 /**
@@ -121,7 +141,7 @@ function getOrderedCandidateModels(primaryModel) {
 }
 
 /**
- * Registra un enfriamiento temporal si el modelo devolvió 429, 503 o timeout.
+ * Registra un enfriamiento temporal si el modelo devolvió 404, 429, 503 o timeout.
  * @param {string} model
  * @param {any} error
  */
@@ -129,11 +149,32 @@ function markModelFailure(model, error) {
   const status = error?.status || error?.statusCode || error?.rawResponse?.status;
   const msg = String(error?.message || '').toLowerCase();
 
-  if (status === 429 || msg.includes('rate limit') || msg.includes('quota')) {
+  if (status === 404 || msg.includes('not found')) {
+    modelCooldownUntil.set(model, Date.now() + 30 * 60 * 1000);
+  } else if (status === 429 || msg.includes('rate limit') || msg.includes('quota')) {
     modelCooldownUntil.set(model, Date.now() + COOLDOWN_429_MS);
   } else if (status === 503 || status === 504 || msg.includes('high demand') || msg.includes('unavailable') || msg.includes('timeout')) {
     modelCooldownUntil.set(model, Date.now() + COOLDOWN_503_MS);
   }
+}
+
+/**
+ * Construye los parámetros de la llamada a Interactions API para cada modelo.
+ */
+function buildRequestParams(model, systemInstruction, inputSteps) {
+  const params = {
+    model,
+    system_instruction: systemInstruction,
+    store: false,
+    input: inputSteps,
+  };
+
+  // Activar razonamiento ligero en modelos Gemini 3/4 para respuestas más inteligentes sin sacrificar velocidad
+  if (model.startsWith('gemini-3') || model.startsWith('gemini-4')) {
+    params.generation_config = { thinking_level: 'low' };
+  }
+
+  return params;
 }
 
 /**
@@ -161,7 +202,7 @@ async function createInteractionFast(client, params) {
 }
 
 /**
- * Genera una respuesta de Gemini manteniendo los últimos 10 mensajes por número de teléfono.
+ * Genera una respuesta de Gemini manteniendo los últimos 20 mensajes por número de teléfono.
  * Incluye respaldo automático rápido entre múltiples modelos y enfriamiento por 429/503.
  *
  * @param {string} phoneNumber - Número de teléfono del usuario (clave en el Map de memoria).
@@ -190,15 +231,14 @@ export async function generateReply(phoneNumber, userMessage, options = {}) {
 
   for (const model of candidateModels) {
     try {
-      interaction = await createInteractionFast(client, {
-        model,
-        system_instruction: systemInstruction,
-        store: false,
-        input: inputSteps,
-      });
+      const params = buildRequestParams(model, systemInstruction, inputSteps);
+      interaction = await createInteractionFast(client, params);
       modelCooldownUntil.delete(model);
+      lastUsedModel = model;
       if (model !== primaryModel) {
         console.warn(`[Gemini] Modelo principal (${primaryModel}) no disponible; respuesta generada con ${model}.`);
+      } else {
+        console.log(`[Gemini] Respuesta generada con ${model}.`);
       }
       break;
     } catch (error) {
