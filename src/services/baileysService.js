@@ -130,18 +130,76 @@ function shouldIgnoreJid(jid) {
 }
 
 const COMMAND_PREFIX = '!';
+const sentByBotIds = new Set();
+
+/**
+ * Registra el ID de un mensaje enviado por el bot para evitar bucles en el chat propio.
+ * @param {object} sent
+ */
+function trackSentMessage(sent) {
+  const id = sent?.key?.id;
+  if (!id) return;
+  sentByBotIds.add(id);
+  setTimeout(() => sentByBotIds.delete(id), 60_000).unref?.();
+}
+
+/**
+ * Envía una respuesta de texto y guarda su ID para ignorarla si vuelve como evento `fromMe`.
+ * @param {object} sock
+ * @param {string} remoteJid
+ * @param {string} text
+ */
+async function sendBotReply(sock, remoteJid, text) {
+  const sent = await sock.sendMessage(remoteJid, { text });
+  trackSentMessage(sent);
+  return sent;
+}
+
+/**
+ * Extrae el identificador base de un JID (sin sufijo de dispositivo `:XX` ni dominio `@...`).
+ * @param {string} jid
+ * @returns {string}
+ */
+function normalizeJidUser(jid) {
+  if (!jid || typeof jid !== 'string') return '';
+  return jid.split('@')[0].split(':')[0];
+}
+
+/**
+ * Determina si el JID corresponde al chat contigo mismo ("Tú"), soportando tanto @s.whatsapp.net como @lid.
+ * @param {object} sock
+ * @param {string} remoteJid
+ * @returns {boolean}
+ */
+function isSelfChat(sock, remoteJid) {
+  const remoteUser = normalizeJidUser(remoteJid);
+  if (!remoteUser) return false;
+
+  const ownCandidates = [
+    normalizeJidUser(sock?.user?.id),
+    normalizeJidUser(sock?.user?.lid),
+    normalizeJidUser(sock?.authState?.creds?.me?.id),
+    normalizeJidUser(sock?.authState?.creds?.me?.lid),
+  ].filter(Boolean);
+
+  return ownCandidates.includes(remoteUser);
+}
 
 /**
  * Procesa un mensaje de texto entrante y responde en el mismo chat usando Gemini
  * únicamente cuando el mensaje comienza con el prefijo `!`.
+ * Permite escribirte a ti mismo en tu propio chat ("Tú") sin responder en chats de terceros donde tú escribes.
  * @param {object} sock
  * @param {object} msg
  */
 async function handleIncomingMessage(sock, msg) {
-  if (!msg?.key || msg.key.fromMe) return;
+  if (!msg?.key) return;
+  if (msg.key.id && sentByBotIds.has(msg.key.id)) return;
 
   const remoteJid = msg.key.remoteJid;
   if (shouldIgnoreJid(remoteJid)) return;
+
+  if (msg.key.fromMe && !isSelfChat(sock, remoteJid)) return;
 
   const rawText = extractMessageText(msg);
   if (!rawText || !rawText.startsWith(COMMAND_PREFIX)) return;
@@ -154,9 +212,11 @@ async function handleIncomingMessage(sock, msg) {
   try {
     if (prompt.toLowerCase() === 'reset') {
       clearConversationHistory(remoteJid);
-      await sock.sendMessage(remoteJid, {
-        text: 'Memoria de conversación reiniciada. ¿En qué puedo ayudarte ahora?',
-      });
+      await sendBotReply(
+        sock,
+        remoteJid,
+        'Memoria de conversación reiniciada. ¿En qué puedo ayudarte ahora?'
+      );
       return;
     }
 
@@ -164,16 +224,16 @@ async function handleIncomingMessage(sock, msg) {
 
     const reply = await generateReply(remoteJid, prompt);
 
-    await sock.sendMessage(remoteJid, { text: reply });
+    await sendBotReply(sock, remoteJid, reply);
 
     console.log(`[WhatsApp] Respuesta enviada a ${remoteJid}.`);
   } catch (error) {
     console.error(`[WhatsApp] Error procesando mensaje de ${remoteJid}:`, error);
-    await sock
-      .sendMessage(remoteJid, {
-        text: 'Lo siento, tuve un problema temporal al consultar la IA. Intenta de nuevo en unos segundos.',
-      })
-      .catch(() => {});
+    await sendBotReply(
+      sock,
+      remoteJid,
+      'Lo siento, tuve un problema temporal al consultar la IA. Intenta de nuevo en unos segundos.'
+    ).catch(() => {});
   } finally {
     await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
   }
