@@ -1,0 +1,31 @@
+{
+  "name": "whatsapp-gemini-chatbot",
+  "version": "1.0.0",
+  "description": "Chatbot de IA para WhatsApp usando @whiskeysockets/baileys y Google Gemini (@google/genai)",
+  "main": "src/index.js",
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "chatbot",
+    "gemini",
+    "baileys",
+    "express"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@google/genai": "^3.6.1",
+    "@supabase/supabase-js": "^2.119.2",
+    "@whiskeysockets/baileys": "^7.0.0-rc14",
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}
