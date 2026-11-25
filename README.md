@@ -1,4 +1,4 @@
-# Chatbot de IA para WhatsApp (Baileys + Google Gemini + Supabase)
+# Chatbot de IA para WhatsApp 
 
 Bot modular en **Node.js + Express** que conecta WhatsApp mediante **`@whiskeysockets/baileys`**, persiste la sesión en **Supabase** (con respaldo automático local en `auth_info/` si no se configura Supabase) y genera respuestas inteligentes con **Google Gemini** (`@google/genai`), con respaldo automático entre modelos y memoria de los últimos 10 mensajes por chat.
 
