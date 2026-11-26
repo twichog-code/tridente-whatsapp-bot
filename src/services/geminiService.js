@@ -1,33 +1,39 @@
 import { GoogleGenAI } from '@google/genai';
 
-const DEFAULT_MODEL = 'gemini-3-flash-preview';
+const DEFAULT_MODEL = 'gemini-4-hydrogen';
 const FALLBACK_MODELS = [
-  'gemini-3-flash-preview',
+  'gemini-4-hydrogen',
   'gemini-3.8-flash',
+  'gemini-3-flash-preview',
   'gemini-3.5-flash-lite',
   'gemini-3.1-flash-lite',
-  'gemma-4-26b-a4b-it',
   'gemma-4-31b-it',
-  'gemini-4-hydrogen',
+  'gemma-4-26b-a4b-it',
 ];
-const REQUEST_TIMEOUT_MS = 14000;
+const REQUEST_TIMEOUT_MS = 35_000;
+const COOLDOWN_404_MS = 30 * 60 * 1000; // 30 min si el modelo no existe en el endpoint
 const COOLDOWN_429_MS = 10 * 60 * 1000; // 10 min si excede cuota/rate limit
 const COOLDOWN_503_MS = 60 * 1000; // 1 min si hay saturación temporal o timeout
-const DEFAULT_SYSTEM_INSTRUCTION = [
-  'Eres Tridente, un pana venezolano muy pila, ocurrente y directo que conversa por WhatsApp.',
-  'Voz y estilo venezolano real:',
-  '- Hablas como un venezolano de verdad escribiendo por WhatsApp: natural, relajado, con chispa y cercanía (usas expresiones como "épale", "qué más", "pana", "chévere", "fino", "dale", "brutal", "al pelo", "de una", "la nevera", "qué locura", etc., solo cuando fluyan natural — nunca forzado ni caricaturesco).',
-  '- Jamás uses modismos de otros países como "qué onda", "wey", "chido", "refri", "tío" ni "vos".',
-  '- CERO tono robótico ni de call center: PROHIBIDO decir "¡Claro que sí!", "¡Por supuesto!", "Como asistente virtual...", "Excelente pregunta" ni rematar los mensajes con "¿En qué más te puedo ayudar hoy?".',
-  '- Escribe como en un chat real de WhatsApp: mensajes cortos, fluidos y al grano (2 a 5 líneas por defecto; solo te extiendes si el tema de verdad lo pide o te piden detalles).',
-  '- Evita listas numeradas rígidas para todo; úsalas solo cuando te pidan pasos, opciones o algo técnico.',
-  '- Eres inteligente y con criterio propio: si es charla casual, vacilas con buen humor; si es algo serio, técnico o de trabajo, te pones pilas y respondes claro y preciso sin perder tu acento venezolano natural.',
-  '- No te presentes en cada mensaje; solo di que te llamas Tridente si te preguntan quién eres o en un primer saludo.',
-  '- Usa *negritas* de WhatsApp (un solo asterisco) solo para resaltar lo clave y emojis con moderación.',
-].join('\n');
-const MAX_HISTORY_MESSAGES = 20;
 
-// Memoria de conversación en memoria: Map<phoneNumber, Array<InteractionStep>>
+const DEFAULT_SYSTEM_INSTRUCTION = [
+  'Eres Tridente, un pana venezolano sumamente inteligente, analítico, ocurrente y directo que conversa por WhatsApp.',
+  'Razonamiento lógico y precisión (PRIORIDAD MÁXIMA):',
+  '- Piensa con rigor lógico paso a paso antes de contestar: modela el estado inicial y cada cambio con cuidado, comprueba cálculos matemáticos, código y relaciones causa-efecto, y valida tu conclusión final antes de escribirla.',
+  '- Nunca respondas a la ligera ni inventes datos ni supongas contradicciones donde no existen. Si falta un dato para resolver algo, dilo claro.',
+  '- Cuando recibas un documento (PDF, Word o PowerPoint), léelo completo con atención, basa tu respuesta estrictamente en su contenido real, referencia secciones/diapositivas o cifras clave, y avisa con honestidad si un dato no aparece en el archivo.',
+  'Voz y estilo venezolano real:',
+  '- Hablas como un venezolano de verdad escribiendo por WhatsApp: natural, pilas, cercano y con buena chispa (usas expresiones como "épale", "qué más", "pana", "chévere", "fino", "dale", "brutal", "al pelo", "de una", etc. solo cuando fluyan natural — jamás forzado ni caricaturesco).',
+  '- Jamás uses modismos de otros países como "qué onda", "wey", "chido", "refri", "tío" ni "vos".',
+  '- CERO tono robótico ni de call center: PROHIBIDO decir "¡Claro que sí!", "¡Por supuesto!", "Como asistente virtual...", "Excelente pregunta" ni rematar cada mensaje con "¿En qué más te puedo ayudar hoy?".',
+  '- Adapta la extensión a lo que haga falta: en charla casual sé ágil y directo (2-4 líneas); en problemas lógicos, preguntas técnicas o análisis de documentos, tómate el espacio necesario para dar una respuesta impecable, clara y bien organizada.',
+  '- No te presentes en cada mensaje; solo di que te llamas Tridente si te preguntan quién eres o en un primer saludo.',
+  '- En WhatsApp las negritas van con UN solo asterisco (*así*), nunca con doble asterisco (**no**).',
+].join('\n');
+
+const MAX_HISTORY_MESSAGES = 20;
+const MAX_HISTORY_DOC_EXCERPT = 2500;
+
+// Memoria de conversación en memoria: Map<chatJid, Array<InteractionStep>>
 const conversationStore = new Map();
 // Enfriamiento temporal por modelo que falló recientemente: Map<model, timestampMs>
 const modelCooldownUntil = new Map();
@@ -37,7 +43,7 @@ let configuredSystemInstruction = null;
 let lastUsedModel = null;
 
 /**
- * Inicializa (de forma perezosa) el cliente oficial de Google GenAI.
+ * Inicializa (de forma perezosa) el cliente oficial de Google GenAI en v1beta.
  * @returns {GoogleGenAI}
  */
 function getClient() {
@@ -88,20 +94,20 @@ export function setSystemInstruction(instruction) {
 }
 
 /**
- * Obtiene una copia del historial de conversación de un número de teléfono.
- * @param {string} phoneNumber
+ * Obtiene una copia del historial de conversación de un chat.
+ * @param {string} chatId
  * @returns {Array<object>}
  */
-export function getConversationHistory(phoneNumber) {
-  return [...(conversationStore.get(phoneNumber) || [])];
+export function getConversationHistory(chatId) {
+  return [...(conversationStore.get(chatId) || [])];
 }
 
 /**
- * Limpia el historial en memoria de un número de teléfono.
- * @param {string} phoneNumber
+ * Limpia el historial en memoria de un chat.
+ * @param {string} chatId
  */
-export function clearConversationHistory(phoneNumber) {
-  conversationStore.delete(phoneNumber);
+export function clearConversationHistory(chatId) {
+  conversationStore.delete(chatId);
 }
 
 /**
@@ -120,11 +126,17 @@ function trimHistory(history) {
 
 /**
  * Ordena los modelos candidatos priorizando los que no estén en enfriamiento.
+ * Si la solicitud lleva un documento nativo (PDF), filtra modelos Gemma que no aceptan `type: 'document'`.
  * @param {string} primaryModel
+ * @param {boolean} requiresNativeDocument
  * @returns {string[]}
  */
-function getOrderedCandidateModels(primaryModel) {
-  const all = [...new Set([primaryModel, ...FALLBACK_MODELS])];
+function getOrderedCandidateModels(primaryModel, requiresNativeDocument) {
+  let all = [...new Set([primaryModel, ...FALLBACK_MODELS])];
+  if (requiresNativeDocument) {
+    all = all.filter((m) => m.startsWith('gemini-'));
+  }
+
   const now = Date.now();
   const ready = [];
   const cooling = [];
@@ -151,16 +163,24 @@ function markModelFailure(model, error) {
   const msg = String(error?.message || '').toLowerCase();
 
   if (status === 404 || msg.includes('not found')) {
-    modelCooldownUntil.set(model, Date.now() + 30 * 60 * 1000);
+    modelCooldownUntil.set(model, Date.now() + COOLDOWN_404_MS);
   } else if (status === 429 || msg.includes('rate limit') || msg.includes('quota')) {
     modelCooldownUntil.set(model, Date.now() + COOLDOWN_429_MS);
-  } else if (status === 503 || status === 504 || msg.includes('high demand') || msg.includes('unavailable') || msg.includes('timeout')) {
+  } else if (
+    status === 503 ||
+    status === 504 ||
+    msg.includes('high demand') ||
+    msg.includes('unavailable') ||
+    msg.includes('timeout')
+  ) {
     modelCooldownUntil.set(model, Date.now() + COOLDOWN_503_MS);
   }
 }
 
 /**
- * Construye los parámetros de la llamada a Interactions API para cada modelo.
+ * Construye los parámetros de la llamada a Interactions API con razonamiento fuerte.
+ * - Modelos Flash-Lite usan `thinking_level: 'high'` para compensar y razonar con máxima precisión.
+ * - Modelos completos (Gemini 4 Hydrogen, 3.8 Flash, 3 Flash) usan `thinking_level: 'medium'` (gran lógica y buena velocidad).
  */
 function buildRequestParams(model, systemInstruction, inputSteps) {
   const params = {
@@ -170,9 +190,10 @@ function buildRequestParams(model, systemInstruction, inputSteps) {
     input: inputSteps,
   };
 
-  // Activar razonamiento ligero en modelos Gemini 3/4 para respuestas más inteligentes sin sacrificar velocidad
-  if (model.startsWith('gemini-3') || model.startsWith('gemini-4')) {
-    params.generation_config = { thinking_level: 'low' };
+  if (model.includes('flash-lite')) {
+    params.generation_config = { thinking_level: 'high' };
+  } else if (model.startsWith('gemini-3') || model.startsWith('gemini-4')) {
+    params.generation_config = { thinking_level: 'medium' };
   }
 
   return params;
@@ -191,7 +212,9 @@ async function createInteractionFast(client, params) {
       }),
       new Promise((_, reject) => {
         timer = setTimeout(() => {
-          const err = new Error(`Tiempo de espera agotado (${REQUEST_TIMEOUT_MS}ms) para ${params.model}`);
+          const err = new Error(
+            `Tiempo de espera agotado (${REQUEST_TIMEOUT_MS}ms) para ${params.model}`
+          );
           err.status = 504;
           reject(err);
         }, REQUEST_TIMEOUT_MS);
@@ -203,29 +226,105 @@ async function createInteractionFast(client, params) {
 }
 
 /**
- * Genera una respuesta de Gemini manteniendo los últimos 20 mensajes por número de teléfono.
- * Incluye respaldo automático rápido entre múltiples modelos y enfriamiento por 429/503.
+ * Construye el paso `user_input` para enviar en esta llamada y la versión ligera para guardar en memoria.
+ */
+function buildUserSteps(userMessage, document) {
+  if (!document) {
+    const step = {
+      type: 'user_input',
+      content: [{ type: 'text', text: userMessage }],
+    };
+    return { requestStep: step, historyStep: step, requiresNativeDocument: false };
+  }
+
+  if (document.kind === 'native_document') {
+    const requestStep = {
+      type: 'user_input',
+      content: [
+        {
+          type: 'document',
+          mime_type: document.mimeType,
+          data: document.base64,
+        },
+        {
+          type: 'text',
+          text: `Archivo adjunto: "${document.fileName}".\nSolicitud del usuario: ${userMessage}`,
+        },
+      ],
+    };
+
+    // En memoria guardamos referencia textual compacta (sin megabytes de base64)
+    const historyStep = {
+      type: 'user_input',
+      content: [
+        {
+          type: 'text',
+          text: `[PDF adjunto: "${document.fileName}"]\n${userMessage}`,
+        },
+      ],
+    };
+
+    return { requestStep, historyStep, requiresNativeDocument: true };
+  }
+
+  // Documento Office / texto extraído
+  const truncationNote = document.truncated
+    ? '\n[Nota: el contenido del archivo era muy extenso y fue recortado al límite máximo.]'
+    : '';
+
+  const fullText =
+    `[Documento ${document.format}: "${document.fileName}"]\n` +
+    `--- INICIO DEL CONTENIDO ---\n${document.text}${truncationNote}\n--- FIN DEL CONTENIDO ---\n\n` +
+    `Solicitud del usuario: ${userMessage}`;
+
+  const excerpt =
+    document.text.length > MAX_HISTORY_DOC_EXCERPT
+      ? `${document.text.slice(0, MAX_HISTORY_DOC_EXCERPT)}... [extracto recortado en memoria]`
+      : document.text;
+
+  const historyText =
+    `[Documento ${document.format}: "${document.fileName}"]\n` +
+    `Extracto:\n${excerpt}\n\nSolicitud del usuario: ${userMessage}`;
+
+  return {
+    requestStep: {
+      type: 'user_input',
+      content: [{ type: 'text', text: fullText }],
+    },
+    historyStep: {
+      type: 'user_input',
+      content: [{ type: 'text', text: historyText }],
+    },
+    requiresNativeDocument: false,
+  };
+}
+
+/**
+ * Genera una respuesta de Gemini manteniendo los últimos 20 mensajes por chat.
+ * Soporta documentos adjuntos (PDF nativo, Word .docx, PowerPoint .pptx y texto),
+ * razonamiento lógico fuerte (`thinking_level`) y respaldo rápido entre modelos.
  *
- * @param {string} phoneNumber - Número de teléfono del usuario (clave en el Map de memoria).
+ * @param {string} chatId - Identificador del chat (clave en el Map de memoria).
  * @param {string} userMessage - Texto del mensaje entrante.
  * @param {object} [options]
  * @param {string} [options.systemInstruction] - Sobrescribe la instrucción de sistema solo para esta llamada.
  * @param {string} [options.model] - Sobrescribe el modelo solo para esta llamada.
+ * @param {object} [options.document] - Resultado de `prepareDocumentForGemini`.
  * @returns {Promise<string>} Respuesta generada en texto plano.
  */
-export async function generateReply(phoneNumber, userMessage, options = {}) {
+export async function generateReply(chatId, userMessage, options = {}) {
   const client = getClient();
   const primaryModel = options.model || process.env.GEMINI_MODEL || DEFAULT_MODEL;
-  const candidateModels = getOrderedCandidateModels(primaryModel);
   const systemInstruction = options.systemInstruction || getSystemInstruction();
 
-  const history = conversationStore.get(phoneNumber) || [];
-  const userStep = {
-    type: 'user_input',
-    content: [{ type: 'text', text: userMessage }],
-  };
+  const history = conversationStore.get(chatId) || [];
+  const { requestStep, historyStep, requiresNativeDocument } = buildUserSteps(
+    userMessage,
+    options.document
+  );
 
-  const inputSteps = trimHistory([...history, userStep]);
+  const candidateModels = getOrderedCandidateModels(primaryModel, requiresNativeDocument);
+  const inputSteps = trimHistory([...history, requestStep]);
 
   let interaction = null;
   let lastError = null;
@@ -237,7 +336,9 @@ export async function generateReply(phoneNumber, userMessage, options = {}) {
       modelCooldownUntil.delete(model);
       lastUsedModel = model;
       if (model !== primaryModel) {
-        console.warn(`[Gemini] Modelo principal (${primaryModel}) no disponible; respuesta generada con ${model}.`);
+        console.warn(
+          `[Gemini] Modelo principal (${primaryModel}) no disponible; respuesta generada con ${model}.`
+        );
       } else {
         console.log(`[Gemini] Respuesta generada con ${model}.`);
       }
@@ -255,14 +356,14 @@ export async function generateReply(phoneNumber, userMessage, options = {}) {
 
   const replyText =
     interaction.output_text?.trim() ||
-    'Lo siento, no pude generar una respuesta en este momento. ¿Podrías intentar de nuevo?';
+    'Epa, no pude armar una respuesta ahorita. Intenta de nuevo en un momento.';
 
   const modelStep = {
     type: 'model_output',
     content: [{ type: 'text', text: replyText }],
   };
 
-  conversationStore.set(phoneNumber, trimHistory([...inputSteps, modelStep]));
+  conversationStore.set(chatId, trimHistory([...history, historyStep, modelStep]));
 
   return replyText;
 }

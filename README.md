@@ -11,9 +11,10 @@ whatsapp-gemini-chatbot/
 ├── src/
 │   ├── index.js                      # Servidor Express (process.env.PORT || 3000) con GET /health
 │   └── services/
-│       ├── baileysService.js         # Conexión WhatsApp (prefijo `!`, QR o código de 8 dígitos, reconexión)
+│       ├── baileysService.js         # Conexión WhatsApp (activación estricta con `!`, documentos, anti-spam)
+│       ├── documentService.js        # Lectura de PDF (nativo), Word (.docx), PowerPoint (.pptx) y texto
 │       ├── supabaseAuthState.js      # Adaptador de sesión de Baileys sobre Supabase (tabla whatsapp_auth)
-│       └── geminiService.js          # Integración @google/genai + respaldo multi-modelo + memoria Map (10 msgs)
+│       └── geminiService.js          # Integración @google/genai + razonamiento fuerte + respaldo multi-modelo
 ├── .env.example                      # Plantilla de variables de entorno
 ├── .gitignore
 ├── package.json
@@ -31,9 +32,11 @@ CREATE TABLE IF NOT EXISTS whatsapp_auth (
   id TEXT PRIMARY KEY,
   data JSONB NOT NULL
 );
+
+ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
 ```
 
-> **Recomendación de seguridad:** en backend/Render utiliza la **`service_role` key** (o configura políticas RLS apropiadas si usas `anon` key). Nunca expongas tu `SUPABASE_KEY` en código frontend ni la subas a Git.
+> **Recomendación de seguridad:** en backend/Render utiliza la **`service_role` key** (con RLS activado, solo tu backend tiene acceso y se bloquea cualquier acceso público con `anon` key). Nunca expongas tu `SUPABASE_KEY` en código frontend ni la subas a Git.
 
 ---
 
@@ -62,9 +65,11 @@ CREATE TABLE IF NOT EXISTS whatsapp_auth (
 
 ## 3. Uso del chatbot
 
-- En chats individuales, inicia tu mensaje con **`!`** para activar al asistente (ejemplo: `!hola`, `! explícame qué es una API`).
-- Los mensajes sin `!` se ignoran para que el bot no responda automáticamente a tus conversaciones normales.
-- Envía **`!reset`** para limpiar la memoria de los últimos 10 mensajes del chat.
+- **Activación estricta únicamente con `!`**: el bot responde solo cuando el mensaje (o el texto adjunto a un documento) comienza con **`!`** (ejemplo: `!hola`, `! explica este problema paso a paso`). Mencionar `"tridente"` sin `!` al inicio se ignora.
+- **Lectura de archivos (PDF, Word `.docx` y PowerPoint `.pptx`)**:
+  - Envía el archivo directamente con un comentario que empiece con `!` (ej. `!resúmeme este PDF`), **o**
+  - Responde (citando) a un archivo ya enviado en el chat escribiendo `!analiza este documento`.
+- **Reiniciar memoria**: envía **`!reset`** para limpiar la memoria de los últimos 20 mensajes del chat.
 
 ---
 

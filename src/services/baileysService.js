@@ -1,11 +1,17 @@
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   fetchLatestWaWebVersion,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
+import {
+  MAX_DOCUMENT_BYTES,
+  UnsupportedDocumentError,
+  prepareDocumentForGemini,
+} from './documentService.js';
 import {
   clearConversationHistory,
   generateReply,
@@ -14,7 +20,10 @@ import { useSupabaseAuthState } from './supabaseAuthState.js';
 
 const AUTH_DIR = 'auth_info';
 const INITIAL_RECONNECT_DELAY_MS = 3000;
-const MAX_RECONNECT_DELAY_MS = 30000;
+const MAX_RECONNECT_DELAY_MS = 30_000;
+const COMMAND_PREFIX = '!';
+const MIN_CHAT_INTERVAL_MS = 3000;
+const MAX_REPLIES_PER_MINUTE = 15;
 
 let activeSocket = null;
 let reconnectTimer = null;
@@ -22,6 +31,11 @@ let reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
 let isShuttingDown = false;
 let connectionStatus = 'disconnected';
 let authStorageMode = 'local';
+
+const sentByBotIds = new Set();
+const recentBotReplies = new Map();
+const lastReplyByChat = new Map();
+const recentGlobalReplyTimestamps = [];
 
 /**
  * Logger mínimo compatible con ILogger de Baileys v7:
@@ -72,7 +86,9 @@ async function resolveAuthState() {
   }
 
   authStorageMode = 'local';
-  console.log(`[WhatsApp] SUPABASE_URL/SUPABASE_KEY no configuradas; usando sesión local en "${AUTH_DIR}".`);
+  console.log(
+    `[WhatsApp] SUPABASE_URL/SUPABASE_KEY no configuradas; usando sesión local en "${AUTH_DIR}".`
+  );
   return useMultiFileAuthState(AUTH_DIR);
 }
 
@@ -92,12 +108,12 @@ async function resolveLatestWaVersion() {
 }
 
 /**
- * Desenvuelve wrappers de mensajes efímeros o de visualización única.
- * @param {object} msg
+ * Desenvuelve wrappers de mensajes efímeros, visualización única o documentos con caption.
+ * @param {object} rawContent
  * @returns {object | null}
  */
-function unwrapMessageContent(msg) {
-  let content = msg?.message;
+function unwrapMessageContent(rawContent) {
+  let content = rawContent;
   if (!content) return null;
 
   if (content.ephemeralMessage?.message) {
@@ -109,37 +125,72 @@ function unwrapMessageContent(msg) {
   if (content.viewOnceMessageV2?.message) {
     content = content.viewOnceMessageV2.message;
   }
+  if (content.documentWithCaptionMessage?.message) {
+    content = content.documentWithCaptionMessage.message;
+  }
 
   return content;
 }
 
 /**
- * Extrae el texto plano de un mensaje entrante de Baileys (soporta mensajes efímeros y texto extendido).
+ * Extrae el texto plano (o caption de documento) de un mensaje de Baileys.
  * @param {object} msg
  * @returns {string | null}
  */
-function extractMessageText(msg) {
-  const content = unwrapMessageContent(msg);
+export function extractMessageText(msg) {
+  const content = unwrapMessageContent(msg?.message);
   if (!content) return null;
 
-  const text = content.conversation || content.extendedTextMessage?.text || null;
+  const text =
+    content.conversation ||
+    content.extendedTextMessage?.text ||
+    content.documentMessage?.caption ||
+    null;
+
   return typeof text === 'string' && text.trim().length > 0 ? text.trim() : null;
 }
 
 /**
- * Extrae los JIDs mencionados nativamente con @ en WhatsApp.
+ * Busca si el mensaje actual adjunta un documento o responde/cita un mensaje con documento.
  * @param {object} msg
- * @returns {string[]}
+ * @returns {{ targetMsg: object, docMsg: object } | null}
  */
-function extractMentionedJids(msg) {
-  const content = unwrapMessageContent(msg);
-  const mentioned = content?.extendedTextMessage?.contextInfo?.mentionedJid;
-  return Array.isArray(mentioned) ? mentioned : [];
+export function extractDocumentSource(msg) {
+  const content = unwrapMessageContent(msg?.message);
+  if (!content) return null;
+
+  // Caso 1: documento enviado directamente en este mensaje (con caption iniciando en `!`)
+  if (content.documentMessage) {
+    return {
+      targetMsg: msg,
+      docMsg: content.documentMessage,
+    };
+  }
+
+  // Caso 2: respuesta/cita a un mensaje previo que contenía un documento
+  const contextInfo = content.extendedTextMessage?.contextInfo;
+  if (contextInfo?.quotedMessage) {
+    const quotedContent = unwrapMessageContent(contextInfo.quotedMessage);
+    if (quotedContent?.documentMessage) {
+      return {
+        targetMsg: {
+          key: {
+            remoteJid: msg.key?.remoteJid,
+            id: contextInfo.stanzaId,
+            participant: contextInfo.participant,
+          },
+          message: contextInfo.quotedMessage,
+        },
+        docMsg: quotedContent.documentMessage,
+      };
+    }
+  }
+
+  return null;
 }
 
 /**
  * Determina si un JID debe ignorarse (estados/difusiones o canales).
- * Los chats individuales y grupos sí se permiten cuando se menciona a Tridente o se usa `!`.
  * @param {string} jid
  * @returns {boolean}
  */
@@ -152,16 +203,20 @@ function shouldIgnoreJid(jid) {
   );
 }
 
-const COMMAND_PREFIX = '!';
-const BOT_NAME_MENTION_REGEX = /(?:^|[\s,.;:!?¿¡(])@?tridente(?=$|[\s,.;:!?),:])/i;
-const LEADING_BOT_NAME_REGEX = /^@?tridente[\s,.:;!?-]*/i;
-const MIN_CHAT_INTERVAL_MS = 3000;
-const MAX_REPLIES_PER_MINUTE = 15;
+/**
+ * Activa el bot ESTRICTA Y ÚNICAMENTE cuando el mensaje comienza con `!`.
+ * Decir "tridente" o "@tridente" sin `!` al inicio NO activa el bot.
+ * @param {string} rawText
+ * @returns {string | null}
+ */
+export function extractTriggeredPrompt(rawText) {
+  if (typeof rawText !== 'string') return null;
+  const trimmed = rawText.trim();
+  if (!trimmed.startsWith(COMMAND_PREFIX)) return null;
 
-const sentByBotIds = new Set();
-const recentBotReplies = new Map();
-const lastReplyByChat = new Map();
-const recentGlobalReplyTimestamps = [];
+  const prompt = trimmed.slice(COMMAND_PREFIX.length).trim();
+  return prompt || null;
+}
 
 /**
  * Enmascara un número de teléfono para no exponerlo en los logs (ej. 584127828100 -> ********8100).
@@ -187,12 +242,6 @@ function maskJid(jid) {
   return `${maskPhone(userPart)}@${domain}`;
 }
 
-/**
- * Registra el ID y contenido reciente de un mensaje enviado por el bot para evitar bucles infinitos.
- * @param {string} remoteJid
- * @param {string} text
- * @param {object} [sent]
- */
 function registerBotReplySignature(remoteJid, text) {
   const sig = `${remoteJid}::${String(text || '').trim()}`;
   recentBotReplies.set(sig, Date.now() + 20_000);
@@ -216,10 +265,6 @@ function isEchoOfBotReply(msg, remoteJid, rawText) {
 
 /**
  * Envía una respuesta de texto y guarda su huella/ID antes y después para evitar cualquier bucle.
- * @param {object} sock
- * @param {string} remoteJid
- * @param {string} text
- * @param {object} [quotedMsg]
  */
 async function sendBotReply(sock, remoteJid, text, quotedMsg = undefined) {
   registerBotReplySignature(remoteJid, text);
@@ -230,76 +275,9 @@ async function sendBotReply(sock, remoteJid, text, quotedMsg = undefined) {
 }
 
 /**
- * Extrae el identificador base de un JID (sin sufijo de dispositivo `:XX` ni dominio `@...`).
- * @param {string} jid
- * @returns {string}
- */
-function normalizeJidUser(jid) {
-  if (!jid || typeof jid !== 'string') return '';
-  return jid.split('@')[0].split(':')[0];
-}
-
-/**
- * Devuelve los identificadores propios de la cuenta conectada (teléfono y LID).
- * @param {object} sock
- * @returns {string[]}
- */
-function getOwnUsers(sock) {
-  return [
-    normalizeJidUser(sock?.user?.id),
-    normalizeJidUser(sock?.user?.lid),
-    normalizeJidUser(sock?.authState?.creds?.me?.id),
-    normalizeJidUser(sock?.authState?.creds?.me?.lid),
-  ].filter(Boolean);
-}
-
-/**
- * Determina si el mensaje menciona nativamente con @ al propio número/LID del bot.
- * @param {object} sock
- * @param {object} msg
- * @returns {boolean}
- */
-function isBotMentionedByJid(sock, msg) {
-  const ownUsers = getOwnUsers(sock);
-  if (ownUsers.length === 0) return false;
-  const mentioned = extractMentionedJids(msg);
-  return mentioned.some((jid) => ownUsers.includes(normalizeJidUser(jid)));
-}
-
-/**
- * Evalúa si un mensaje activa al bot y extrae el prompt limpio para Gemini.
- * Reglas:
- * - Empieza con `!` -> se activa en cualquier chat o grupo.
- * - Menciona `tridente` o `@tridente` -> se activa en cualquier chat o grupo.
- * - Tú (`fromMe`) etiquetas nativamente tu propia cuenta con `@` -> se activa.
- * @param {object} sock
- * @param {object} msg
- * @param {string} rawText
- * @returns {string | null}
- */
-function extractTriggeredPrompt(sock, msg, rawText) {
-  if (rawText.startsWith(COMMAND_PREFIX)) {
-    const prompt = rawText.slice(COMMAND_PREFIX.length).trim();
-    return prompt || null;
-  }
-
-  if (BOT_NAME_MENTION_REGEX.test(rawText)) {
-    const cleaned = rawText.replace(LEADING_BOT_NAME_REGEX, '').trim();
-    return cleaned || 'Épale Tridente';
-  }
-
-  if (msg.key?.fromMe && isBotMentionedByJid(sock, msg)) {
-    const cleaned = rawText.replace(/@\d+/g, '').trim();
-    return cleaned || 'Épale Tridente';
-  }
-
-  return null;
-}
-
-/**
  * Protección anti-spam para cuidar el número de WhatsApp contra ráfagas o bloqueos.
  * @param {string} remoteJid
- * @returns {boolean} true si se permite responder
+ * @returns {boolean}
  */
 function checkRateLimit(remoteJid) {
   const now = Date.now();
@@ -308,13 +286,17 @@ function checkRateLimit(remoteJid) {
     return false;
   }
 
-  // Limpiar timestamps mayores a 1 minuto
-  while (recentGlobalReplyTimestamps.length > 0 && now - recentGlobalReplyTimestamps[0] > 60_000) {
+  while (
+    recentGlobalReplyTimestamps.length > 0 &&
+    now - recentGlobalReplyTimestamps[0] > 60_000
+  ) {
     recentGlobalReplyTimestamps.shift();
   }
 
   if (recentGlobalReplyTimestamps.length >= MAX_REPLIES_PER_MINUTE) {
-    console.warn('[WhatsApp] Límite anti-spam alcanzado temporalmente; mensaje omitido para proteger el número.');
+    console.warn(
+      '[WhatsApp] Límite anti-spam alcanzado temporalmente; mensaje omitido para proteger el número.'
+    );
     return false;
   }
 
@@ -324,8 +306,8 @@ function checkRateLimit(remoteJid) {
 }
 
 /**
- * Procesa un mensaje de texto entrante y responde en el mismo chat o grupo usando Gemini
- * cuando se activa con `!` o mencionando a Tridente (`tridente` / `@tridente`).
+ * Procesa mensajes entrantes y responde ÚNICAMENTE cuando el texto (o caption del archivo)
+ * empieza con `!`. Soporta lectura de PDF, Word (.docx) y PowerPoint (.pptx) adjuntos o citados.
  * @param {object} sock
  * @param {object} msg
  */
@@ -340,15 +322,18 @@ async function handleIncomingMessage(sock, msg) {
 
   if (isEchoOfBotReply(msg, remoteJid, rawText)) return;
 
-  const prompt = extractTriggeredPrompt(sock, msg, rawText);
+  const prompt = extractTriggeredPrompt(rawText);
   if (!prompt) return;
 
   if (!checkRateLimit(remoteJid)) return;
 
   const isGroup = remoteJid.endsWith('@g.us');
   const quotedTarget = isGroup ? msg : undefined;
+  const docSource = extractDocumentSource(msg);
 
-  console.log(`[WhatsApp] Activado en ${maskJid(remoteJid)}: "${prompt.slice(0, 80)}"`);
+  console.log(
+    `[WhatsApp] Comando ! en ${maskJid(remoteJid)}${docSource ? ' [con archivo]' : ''}: "${prompt.slice(0, 80)}"`
+  );
 
   try {
     if (prompt.toLowerCase() === 'reset') {
@@ -364,17 +349,54 @@ async function handleIncomingMessage(sock, msg) {
 
     await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
 
-    const reply = await generateReply(remoteJid, prompt);
+    let preparedDocument = undefined;
+    if (docSource) {
+      const fileName = docSource.docMsg.fileName || 'documento';
+      const mimeType = docSource.docMsg.mimetype || '';
+      const declaredSize = Number(docSource.docMsg.fileLength || 0);
+
+      if (declaredSize > MAX_DOCUMENT_BYTES) {
+        const maxMb = Math.round(MAX_DOCUMENT_BYTES / (1024 * 1024));
+        await sendBotReply(
+          sock,
+          remoteJid,
+          `Pana, ese archivo "${fileName}" pasa de ${maxMb} MB. Mándamelo un poco más liviano para poder leerlo.`,
+          quotedTarget
+        );
+        return;
+      }
+
+      const buffer = await downloadMediaMessage(
+        docSource.targetMsg,
+        'buffer',
+        {},
+        {
+          logger: baileysLogger,
+          reuploadRequest: sock.updateMediaMessage,
+        }
+      );
+
+      preparedDocument = await prepareDocumentForGemini(buffer, { mimeType, fileName });
+    }
+
+    const reply = await generateReply(remoteJid, prompt, {
+      document: preparedDocument,
+    });
 
     await sendBotReply(sock, remoteJid, reply, quotedTarget);
 
     console.log(`[WhatsApp] Respuesta enviada a ${maskJid(remoteJid)}.`);
   } catch (error) {
+    if (error instanceof UnsupportedDocumentError) {
+      await sendBotReply(sock, remoteJid, error.message, quotedTarget).catch(() => {});
+      return;
+    }
+
     console.error(`[WhatsApp] Error procesando mensaje en ${maskJid(remoteJid)}:`, error);
     await sendBotReply(
       sock,
       remoteJid,
-      'Epa, me dio un fallo momentáneo consultando la IA. Intenta de nuevo en unos segundos.',
+      'Epa, me dio un fallo momentáneo procesando eso. Intenta de nuevo en unos segundos.',
       quotedTarget
     ).catch(() => {});
   } finally {
@@ -436,7 +458,9 @@ export async function startWhatsApp() {
         }
       } else {
         connectionStatus = 'qr';
-        console.log('\n[WhatsApp] Escanea el siguiente código QR con tu teléfono (Dispositivos vinculados):\n');
+        console.log(
+          '\n[WhatsApp] Escanea el siguiente código QR con tu teléfono (Dispositivos vinculados):\n'
+        );
         qrcode.generate(qr, { small: true });
       }
     }
@@ -444,7 +468,9 @@ export async function startWhatsApp() {
     if (connection === 'open') {
       connectionStatus = 'open';
       reconnectDelayMs = INITIAL_RECONNECT_DELAY_MS;
-      console.log('[WhatsApp] Conexión establecida correctamente. El bot está listo para responder.');
+      console.log(
+        '[WhatsApp] Conexión establecida correctamente. El bot está listo para responder (solo con prefijo !).'
+      );
     }
 
     if (connection === 'close') {
@@ -500,9 +526,7 @@ export async function startWhatsApp() {
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify' || !Array.isArray(messages)) return;
 
-    await Promise.allSettled(
-      messages.map((msg) => handleIncomingMessage(sock, msg))
-    );
+    await Promise.allSettled(messages.map((msg) => handleIncomingMessage(sock, msg)));
   });
 
   return sock;
