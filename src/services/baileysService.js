@@ -92,11 +92,11 @@ async function resolveLatestWaVersion() {
 }
 
 /**
- * Extrae el texto plano de un mensaje entrante de Baileys (soporta mensajes efímeros y texto extendido).
+ * Desenvuelve wrappers de mensajes efímeros o de visualización única.
  * @param {object} msg
- * @returns {string | null}
+ * @returns {object | null}
  */
-function extractMessageText(msg) {
+function unwrapMessageContent(msg) {
   let content = msg?.message;
   if (!content) return null;
 
@@ -110,19 +110,42 @@ function extractMessageText(msg) {
     content = content.viewOnceMessageV2.message;
   }
 
+  return content;
+}
+
+/**
+ * Extrae el texto plano de un mensaje entrante de Baileys (soporta mensajes efímeros y texto extendido).
+ * @param {object} msg
+ * @returns {string | null}
+ */
+function extractMessageText(msg) {
+  const content = unwrapMessageContent(msg);
+  if (!content) return null;
+
   const text = content.conversation || content.extendedTextMessage?.text || null;
   return typeof text === 'string' && text.trim().length > 0 ? text.trim() : null;
 }
 
 /**
- * Determina si un JID debe ignorarse (grupos, estados/difusiones o canales).
+ * Extrae los JIDs mencionados nativamente con @ en WhatsApp.
+ * @param {object} msg
+ * @returns {string[]}
+ */
+function extractMentionedJids(msg) {
+  const content = unwrapMessageContent(msg);
+  const mentioned = content?.extendedTextMessage?.contextInfo?.mentionedJid;
+  return Array.isArray(mentioned) ? mentioned : [];
+}
+
+/**
+ * Determina si un JID debe ignorarse (estados/difusiones o canales).
+ * Los chats individuales y grupos sí se permiten cuando se menciona a Tridente o se usa `!`.
  * @param {string} jid
  * @returns {boolean}
  */
 function shouldIgnoreJid(jid) {
   return (
     !jid ||
-    jid.endsWith('@g.us') ||
     jid === 'status@broadcast' ||
     jid.endsWith('@broadcast') ||
     jid.endsWith('@newsletter')
@@ -130,12 +153,52 @@ function shouldIgnoreJid(jid) {
 }
 
 const COMMAND_PREFIX = '!';
+const BOT_NAME_MENTION_REGEX = /(?:^|[\s,.;:!?¿¡(])@?tridente(?=$|[\s,.;:!?),:])/i;
+const LEADING_BOT_NAME_REGEX = /^@?tridente[\s,.:;!?-]*/i;
+const MIN_CHAT_INTERVAL_MS = 3000;
+const MAX_REPLIES_PER_MINUTE = 15;
+
 const sentByBotIds = new Set();
+const recentBotReplies = new Map();
+const lastReplyByChat = new Map();
+const recentGlobalReplyTimestamps = [];
 
 /**
- * Registra el ID de un mensaje enviado por el bot para evitar bucles en el chat propio.
- * @param {object} sent
+ * Enmascara un número de teléfono para no exponerlo en los logs (ej. 584127828100 -> ********8100).
+ * @param {string} phone
+ * @returns {string}
  */
+function maskPhone(phone) {
+  const digits = String(phone || '').replace(/\D/g, '');
+  if (digits.length <= 4) return '****';
+  return `${'*'.repeat(digits.length - 4)}${digits.slice(-4)}`;
+}
+
+/**
+ * Enmascara un JID en logs para proteger números de teléfono en Render/consola.
+ * @param {string} jid
+ * @returns {string}
+ */
+function maskJid(jid) {
+  if (!jid || typeof jid !== 'string') return 'desconocido';
+  const [userPart, domain] = jid.split('@');
+  if (!domain) return maskPhone(userPart);
+  if (domain === 'g.us') return `grupo:***${userPart.slice(-4)}`;
+  return `${maskPhone(userPart)}@${domain}`;
+}
+
+/**
+ * Registra el ID y contenido reciente de un mensaje enviado por el bot para evitar bucles infinitos.
+ * @param {string} remoteJid
+ * @param {string} text
+ * @param {object} [sent]
+ */
+function registerBotReplySignature(remoteJid, text) {
+  const sig = `${remoteJid}::${String(text || '').trim()}`;
+  recentBotReplies.set(sig, Date.now() + 20_000);
+  setTimeout(() => recentBotReplies.delete(sig), 20_000).unref?.();
+}
+
 function trackSentMessage(sent) {
   const id = sent?.key?.id;
   if (!id) return;
@@ -143,14 +206,25 @@ function trackSentMessage(sent) {
   setTimeout(() => sentByBotIds.delete(id), 60_000).unref?.();
 }
 
+function isEchoOfBotReply(msg, remoteJid, rawText) {
+  if (msg?.key?.id && sentByBotIds.has(msg.key.id)) return true;
+  if (!msg?.key?.fromMe) return false;
+  const sig = `${remoteJid}::${String(rawText || '').trim()}`;
+  const expiresAt = recentBotReplies.get(sig);
+  return Boolean(expiresAt && expiresAt > Date.now());
+}
+
 /**
- * Envía una respuesta de texto y guarda su ID para ignorarla si vuelve como evento `fromMe`.
+ * Envía una respuesta de texto y guarda su huella/ID antes y después para evitar cualquier bucle.
  * @param {object} sock
  * @param {string} remoteJid
  * @param {string} text
+ * @param {object} [quotedMsg]
  */
-async function sendBotReply(sock, remoteJid, text) {
-  const sent = await sock.sendMessage(remoteJid, { text });
+async function sendBotReply(sock, remoteJid, text, quotedMsg = undefined) {
+  registerBotReplySignature(remoteJid, text);
+  const options = quotedMsg ? { quoted: quotedMsg } : undefined;
+  const sent = await sock.sendMessage(remoteJid, { text }, options);
   trackSentMessage(sent);
   return sent;
 }
@@ -166,48 +240,115 @@ function normalizeJidUser(jid) {
 }
 
 /**
- * Determina si el JID corresponde al chat contigo mismo ("Tú"), soportando tanto @s.whatsapp.net como @lid.
+ * Devuelve los identificadores propios de la cuenta conectada (teléfono y LID).
  * @param {object} sock
- * @param {string} remoteJid
- * @returns {boolean}
+ * @returns {string[]}
  */
-function isSelfChat(sock, remoteJid) {
-  const remoteUser = normalizeJidUser(remoteJid);
-  if (!remoteUser) return false;
-
-  const ownCandidates = [
+function getOwnUsers(sock) {
+  return [
     normalizeJidUser(sock?.user?.id),
     normalizeJidUser(sock?.user?.lid),
     normalizeJidUser(sock?.authState?.creds?.me?.id),
     normalizeJidUser(sock?.authState?.creds?.me?.lid),
   ].filter(Boolean);
-
-  return ownCandidates.includes(remoteUser);
 }
 
 /**
- * Procesa un mensaje de texto entrante y responde en el mismo chat usando Gemini
- * únicamente cuando el mensaje comienza con el prefijo `!`.
- * Permite escribirte a ti mismo en tu propio chat ("Tú") sin responder en chats de terceros donde tú escribes.
+ * Determina si el mensaje menciona nativamente con @ al propio número/LID del bot.
+ * @param {object} sock
+ * @param {object} msg
+ * @returns {boolean}
+ */
+function isBotMentionedByJid(sock, msg) {
+  const ownUsers = getOwnUsers(sock);
+  if (ownUsers.length === 0) return false;
+  const mentioned = extractMentionedJids(msg);
+  return mentioned.some((jid) => ownUsers.includes(normalizeJidUser(jid)));
+}
+
+/**
+ * Evalúa si un mensaje activa al bot y extrae el prompt limpio para Gemini.
+ * Reglas:
+ * - Empieza con `!` -> se activa en cualquier chat o grupo.
+ * - Menciona `tridente` o `@tridente` -> se activa en cualquier chat o grupo.
+ * - Tú (`fromMe`) etiquetas nativamente tu propia cuenta con `@` -> se activa.
+ * @param {object} sock
+ * @param {object} msg
+ * @param {string} rawText
+ * @returns {string | null}
+ */
+function extractTriggeredPrompt(sock, msg, rawText) {
+  if (rawText.startsWith(COMMAND_PREFIX)) {
+    const prompt = rawText.slice(COMMAND_PREFIX.length).trim();
+    return prompt || null;
+  }
+
+  if (BOT_NAME_MENTION_REGEX.test(rawText)) {
+    const cleaned = rawText.replace(LEADING_BOT_NAME_REGEX, '').trim();
+    return cleaned || 'Épale Tridente';
+  }
+
+  if (msg.key?.fromMe && isBotMentionedByJid(sock, msg)) {
+    const cleaned = rawText.replace(/@\d+/g, '').trim();
+    return cleaned || 'Épale Tridente';
+  }
+
+  return null;
+}
+
+/**
+ * Protección anti-spam para cuidar el número de WhatsApp contra ráfagas o bloqueos.
+ * @param {string} remoteJid
+ * @returns {boolean} true si se permite responder
+ */
+function checkRateLimit(remoteJid) {
+  const now = Date.now();
+  const lastChatReply = lastReplyByChat.get(remoteJid) || 0;
+  if (now - lastChatReply < MIN_CHAT_INTERVAL_MS) {
+    return false;
+  }
+
+  // Limpiar timestamps mayores a 1 minuto
+  while (recentGlobalReplyTimestamps.length > 0 && now - recentGlobalReplyTimestamps[0] > 60_000) {
+    recentGlobalReplyTimestamps.shift();
+  }
+
+  if (recentGlobalReplyTimestamps.length >= MAX_REPLIES_PER_MINUTE) {
+    console.warn('[WhatsApp] Límite anti-spam alcanzado temporalmente; mensaje omitido para proteger el número.');
+    return false;
+  }
+
+  lastReplyByChat.set(remoteJid, now);
+  recentGlobalReplyTimestamps.push(now);
+  return true;
+}
+
+/**
+ * Procesa un mensaje de texto entrante y responde en el mismo chat o grupo usando Gemini
+ * cuando se activa con `!` o mencionando a Tridente (`tridente` / `@tridente`).
  * @param {object} sock
  * @param {object} msg
  */
 async function handleIncomingMessage(sock, msg) {
   if (!msg?.key) return;
-  if (msg.key.id && sentByBotIds.has(msg.key.id)) return;
 
   const remoteJid = msg.key.remoteJid;
   if (shouldIgnoreJid(remoteJid)) return;
 
-  if (msg.key.fromMe && !isSelfChat(sock, remoteJid)) return;
-
   const rawText = extractMessageText(msg);
-  if (!rawText || !rawText.startsWith(COMMAND_PREFIX)) return;
+  if (!rawText) return;
 
-  const prompt = rawText.slice(COMMAND_PREFIX.length).trim();
+  if (isEchoOfBotReply(msg, remoteJid, rawText)) return;
+
+  const prompt = extractTriggeredPrompt(sock, msg, rawText);
   if (!prompt) return;
 
-  console.log(`[WhatsApp] Mensaje recibido de ${remoteJid}: "${prompt}"`);
+  if (!checkRateLimit(remoteJid)) return;
+
+  const isGroup = remoteJid.endsWith('@g.us');
+  const quotedTarget = isGroup ? msg : undefined;
+
+  console.log(`[WhatsApp] Activado en ${maskJid(remoteJid)}: "${prompt.slice(0, 80)}"`);
 
   try {
     if (prompt.toLowerCase() === 'reset') {
@@ -215,7 +356,8 @@ async function handleIncomingMessage(sock, msg) {
       await sendBotReply(
         sock,
         remoteJid,
-        'Memoria de conversación reiniciada. ¿En qué puedo ayudarte ahora?'
+        'Listo pana, borré la memoria de este chat. Arrancamos de cero.',
+        quotedTarget
       );
       return;
     }
@@ -224,15 +366,16 @@ async function handleIncomingMessage(sock, msg) {
 
     const reply = await generateReply(remoteJid, prompt);
 
-    await sendBotReply(sock, remoteJid, reply);
+    await sendBotReply(sock, remoteJid, reply, quotedTarget);
 
-    console.log(`[WhatsApp] Respuesta enviada a ${remoteJid}.`);
+    console.log(`[WhatsApp] Respuesta enviada a ${maskJid(remoteJid)}.`);
   } catch (error) {
-    console.error(`[WhatsApp] Error procesando mensaje de ${remoteJid}:`, error);
+    console.error(`[WhatsApp] Error procesando mensaje en ${maskJid(remoteJid)}:`, error);
     await sendBotReply(
       sock,
       remoteJid,
-      'Lo siento, tuve un problema temporal al consultar la IA. Intenta de nuevo en unos segundos.'
+      'Epa, me dio un fallo momentáneo consultando la IA. Intenta de nuevo en unos segundos.',
+      quotedTarget
     ).catch(() => {});
   } finally {
     await sock.sendPresenceUpdate('paused', remoteJid).catch(() => {});
@@ -283,7 +426,7 @@ export async function startWhatsApp() {
             const code = await sock.requestPairingCode(pairingNumber);
             const formatted = code?.match(/.{1,4}/g)?.join('-') || code;
             console.log(
-              `\n[WhatsApp] Código de vinculación para +${pairingNumber}: ${formatted}\n` +
+              `\n[WhatsApp] Código de vinculación para +${maskPhone(pairingNumber)}: ${formatted}\n` +
                 'En tu teléfono ve a: WhatsApp → Dispositivos vinculados → Vincular un dispositivo → Vincular con el número de teléfono.\n'
             );
           } catch (err) {
