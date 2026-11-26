@@ -133,7 +133,7 @@ function unwrapMessageContent(rawContent) {
 }
 
 /**
- * Extrae el texto plano (o caption de documento) de un mensaje de Baileys.
+ * Extrae el texto plano (o caption de foto/documento) de un mensaje de Baileys.
  * @param {object} msg
  * @returns {string | null}
  */
@@ -144,6 +144,7 @@ export function extractMessageText(msg) {
   const text =
     content.conversation ||
     content.extendedTextMessage?.text ||
+    content.imageMessage?.caption ||
     content.documentMessage?.caption ||
     null;
 
@@ -151,27 +152,54 @@ export function extractMessageText(msg) {
 }
 
 /**
- * Busca si el mensaje actual adjunta un documento o responde/cita un mensaje con documento.
+ * Extrae metadatos unificados de un documento o imagen dentro de un mensaje desenvuelto.
+ * @param {object} unwrappedContent
+ * @returns {{ mimetype: string, fileName: string, fileLength: number } | null}
+ */
+function pickMediaMetadata(unwrappedContent) {
+  if (unwrappedContent?.documentMessage) {
+    const doc = unwrappedContent.documentMessage;
+    return {
+      mimetype: doc.mimetype || '',
+      fileName: doc.fileName || 'documento',
+      fileLength: Number(doc.fileLength || 0),
+    };
+  }
+  if (unwrappedContent?.imageMessage) {
+    const img = unwrappedContent.imageMessage;
+    return {
+      mimetype: img.mimetype || 'image/jpeg',
+      fileName: 'foto.jpg',
+      fileLength: Number(img.fileLength || 0),
+    };
+  }
+  return null;
+}
+
+/**
+ * Busca si el mensaje actual adjunta una foto/documento o responde/cita un mensaje con foto/documento.
  * @param {object} msg
- * @returns {{ targetMsg: object, docMsg: object } | null}
+ * @returns {{ targetMsg: object, docMsg: { mimetype: string, fileName: string, fileLength: number } } | null}
  */
 export function extractDocumentSource(msg) {
   const content = unwrapMessageContent(msg?.message);
   if (!content) return null;
 
-  // Caso 1: documento enviado directamente en este mensaje (con caption iniciando en `!`)
-  if (content.documentMessage) {
+  // Caso 1: foto o documento enviado directamente en este mensaje (con caption iniciando en `!`)
+  const directMeta = pickMediaMetadata(content);
+  if (directMeta) {
     return {
       targetMsg: msg,
-      docMsg: content.documentMessage,
+      docMsg: directMeta,
     };
   }
 
-  // Caso 2: respuesta/cita a un mensaje previo que contenía un documento
+  // Caso 2: respuesta/cita a un mensaje previo que contenía una foto o documento
   const contextInfo = content.extendedTextMessage?.contextInfo;
   if (contextInfo?.quotedMessage) {
     const quotedContent = unwrapMessageContent(contextInfo.quotedMessage);
-    if (quotedContent?.documentMessage) {
+    const quotedMeta = pickMediaMetadata(quotedContent);
+    if (quotedMeta) {
       return {
         targetMsg: {
           key: {
@@ -181,7 +209,7 @@ export function extractDocumentSource(msg) {
           },
           message: contextInfo.quotedMessage,
         },
-        docMsg: quotedContent.documentMessage,
+        docMsg: quotedMeta,
       };
     }
   }

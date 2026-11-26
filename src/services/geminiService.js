@@ -1,4 +1,9 @@
 import { GoogleGenAI } from '@google/genai';
+import {
+  getCurrentDateVenezuela,
+  searchWebLive,
+  shouldSearchWeb,
+} from './webSearchService.js';
 
 const DEFAULT_MODEL = 'gemini-4-hydrogen';
 const FALLBACK_MODELS = [
@@ -20,12 +25,13 @@ const DEFAULT_SYSTEM_INSTRUCTION = [
   'Razonamiento lógico y precisión (PRIORIDAD MÁXIMA):',
   '- Piensa con rigor lógico paso a paso antes de contestar: modela el estado inicial y cada cambio con cuidado, comprueba cálculos matemáticos, código y relaciones causa-efecto, y valida tu conclusión final antes de escribirla.',
   '- Nunca respondas a la ligera ni inventes datos ni supongas contradicciones donde no existen. Si falta un dato para resolver algo, dilo claro.',
-  '- Cuando recibas un documento (PDF, Word o PowerPoint), léelo completo con atención, basa tu respuesta estrictamente en su contenido real, referencia secciones/diapositivas o cifras clave, y avisa con honestidad si un dato no aparece en el archivo.',
+  '- Cuando recibas una imagen/foto o documento (PDF, Word o PowerPoint), analízalo completo con atención (lee texto manuscrito, ecuaciones, capturas, tablas o diapositivas), basa tu respuesta en su contenido real y avisa si algo no se distingue bien.',
+  '- Cuando recibas un bloque [RESULTADOS DE BÚSQUEDA EN INTERNET EN VIVO], PRIORIZA siempre esa información actual y sus fechas sobre tu memoria de entrenamiento vieja. Si los titulares o resúmenes contienen cifras, tasas (como una tasa BCV publicada el día anterior vigente para hoy), ganadores o hechos recientes, cítalos directamente con su fecha exacta en lugar de decir que no tienes el dato.',
   'Voz y estilo venezolano real:',
   '- Hablas como un venezolano de verdad escribiendo por WhatsApp: natural, pilas, cercano y con buena chispa (usas expresiones como "épale", "qué más", "pana", "chévere", "fino", "dale", "brutal", "al pelo", "de una", etc. solo cuando fluyan natural — jamás forzado ni caricaturesco).',
   '- Jamás uses modismos de otros países como "qué onda", "wey", "chido", "refri", "tío" ni "vos".',
   '- CERO tono robótico ni de call center: PROHIBIDO decir "¡Claro que sí!", "¡Por supuesto!", "Como asistente virtual...", "Excelente pregunta" ni rematar cada mensaje con "¿En qué más te puedo ayudar hoy?".',
-  '- Adapta la extensión a lo que haga falta: en charla casual sé ágil y directo (2-4 líneas); en problemas lógicos, preguntas técnicas o análisis de documentos, tómate el espacio necesario para dar una respuesta impecable, clara y bien organizada.',
+  '- Adapta la extensión a lo que haga falta: en charla casual sé ágil y directo (2-4 líneas); en problemas lógicos, preguntas técnicas o análisis de fotos/documentos, tómate el espacio necesario para dar una respuesta impecable, clara y bien organizada.',
   '- No te presentes en cada mensaje; solo di que te llamas Tridente si te preguntan quién eres o en un primer saludo.',
   '- En WhatsApp las negritas van con UN solo asterisco (*así*), nunca con doble asterisco (**no**).',
 ].join('\n');
@@ -71,15 +77,15 @@ export function getModelInfo() {
 }
 
 /**
- * Devuelve la instrucción de sistema activa.
+ * Devuelve la instrucción de sistema activa enriquecida con la fecha actual de Venezuela.
  * @returns {string}
  */
 export function getSystemInstruction() {
-  return (
+  const base =
     configuredSystemInstruction ||
     process.env.SYSTEM_INSTRUCTION ||
-    DEFAULT_SYSTEM_INSTRUCTION
-  );
+    DEFAULT_SYSTEM_INSTRUCTION;
+  return `${base}\n\nFecha actual (Venezuela): ${getCurrentDateVenezuela()}.`;
 }
 
 /**
@@ -126,14 +132,14 @@ function trimHistory(history) {
 
 /**
  * Ordena los modelos candidatos priorizando los que no estén en enfriamiento.
- * Si la solicitud lleva un documento nativo (PDF), filtra modelos Gemma que no aceptan `type: 'document'`.
+ * Si la solicitud lleva contenido multimodal nativo (PDF o imagen), prioriza modelos Gemini.
  * @param {string} primaryModel
- * @param {boolean} requiresNativeDocument
+ * @param {boolean} requiresNativeMultimodal
  * @returns {string[]}
  */
-function getOrderedCandidateModels(primaryModel, requiresNativeDocument) {
+function getOrderedCandidateModels(primaryModel, requiresNativeMultimodal) {
   let all = [...new Set([primaryModel, ...FALLBACK_MODELS])];
-  if (requiresNativeDocument) {
+  if (requiresNativeMultimodal) {
     all = all.filter((m) => m.startsWith('gemini-'));
   }
 
@@ -179,8 +185,6 @@ function markModelFailure(model, error) {
 
 /**
  * Construye los parámetros de la llamada a Interactions API con razonamiento fuerte.
- * - Modelos Flash-Lite usan `thinking_level: 'high'` para compensar y razonar con máxima precisión.
- * - Modelos completos (Gemini 4 Hydrogen, 3.8 Flash, 3 Flash) usan `thinking_level: 'medium'` (gran lógica y buena velocidad).
  */
 function buildRequestParams(model, systemInstruction, inputSteps) {
   const params = {
@@ -226,48 +230,86 @@ async function createInteractionFast(client, params) {
 }
 
 /**
- * Construye el paso `user_input` para enviar en esta llamada y la versión ligera para guardar en memoria.
+ * Construye el paso `user_input` para enviar en esta llamada (con imagen, documento o búsqueda web)
+ * y la versión ligera para guardar en memoria.
  */
-function buildUserSteps(userMessage, document) {
+function buildUserSteps(userMessage, document, webContext) {
+  const enrichedPrompt = webContext
+    ? `${webContext}\n\nPregunta del usuario: ${userMessage}`
+    : userMessage;
+
   if (!document) {
-    const step = {
-      type: 'user_input',
-      content: [{ type: 'text', text: userMessage }],
+    return {
+      requestStep: {
+        type: 'user_input',
+        content: [{ type: 'text', text: enrichedPrompt }],
+      },
+      historyStep: {
+        type: 'user_input',
+        content: [{ type: 'text', text: userMessage }],
+      },
+      requiresNativeMultimodal: false,
     };
-    return { requestStep: step, historyStep: step, requiresNativeDocument: false };
+  }
+
+  if (document.kind === 'native_image') {
+    return {
+      requestStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'image',
+            mime_type: document.mimeType,
+            data: document.base64,
+          },
+          {
+            type: 'text',
+            text: enrichedPrompt,
+          },
+        ],
+      },
+      historyStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'text',
+            text: `[Imagen adjunta: "${document.fileName}"]\n${userMessage}`,
+          },
+        ],
+      },
+      requiresNativeMultimodal: true,
+    };
   }
 
   if (document.kind === 'native_document') {
-    const requestStep = {
-      type: 'user_input',
-      content: [
-        {
-          type: 'document',
-          mime_type: document.mimeType,
-          data: document.base64,
-        },
-        {
-          type: 'text',
-          text: `Archivo adjunto: "${document.fileName}".\nSolicitud del usuario: ${userMessage}`,
-        },
-      ],
+    return {
+      requestStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'document',
+            mime_type: document.mimeType,
+            data: document.base64,
+          },
+          {
+            type: 'text',
+            text: `Archivo adjunto: "${document.fileName}".\nSolicitud del usuario: ${enrichedPrompt}`,
+          },
+        ],
+      },
+      historyStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'text',
+            text: `[PDF adjunto: "${document.fileName}"]\n${userMessage}`,
+          },
+        ],
+      },
+      requiresNativeMultimodal: true,
     };
-
-    // En memoria guardamos referencia textual compacta (sin megabytes de base64)
-    const historyStep = {
-      type: 'user_input',
-      content: [
-        {
-          type: 'text',
-          text: `[PDF adjunto: "${document.fileName}"]\n${userMessage}`,
-        },
-      ],
-    };
-
-    return { requestStep, historyStep, requiresNativeDocument: true };
   }
 
-  // Documento Office / texto extraído
   const truncationNote = document.truncated
     ? '\n[Nota: el contenido del archivo era muy extenso y fue recortado al límite máximo.]'
     : '';
@@ -275,7 +317,7 @@ function buildUserSteps(userMessage, document) {
   const fullText =
     `[Documento ${document.format}: "${document.fileName}"]\n` +
     `--- INICIO DEL CONTENIDO ---\n${document.text}${truncationNote}\n--- FIN DEL CONTENIDO ---\n\n` +
-    `Solicitud del usuario: ${userMessage}`;
+    `Solicitud del usuario: ${enrichedPrompt}`;
 
   const excerpt =
     document.text.length > MAX_HISTORY_DOC_EXCERPT
@@ -295,21 +337,22 @@ function buildUserSteps(userMessage, document) {
       type: 'user_input',
       content: [{ type: 'text', text: historyText }],
     },
-    requiresNativeDocument: false,
+    requiresNativeMultimodal: false,
   };
 }
 
 /**
  * Genera una respuesta de Gemini manteniendo los últimos 20 mensajes por chat.
- * Soporta documentos adjuntos (PDF nativo, Word .docx, PowerPoint .pptx y texto),
- * razonamiento lógico fuerte (`thinking_level`) y respaldo rápido entre modelos.
+ * Soporta visión de imágenes/fotos, PDF nativo, Word (.docx), PowerPoint (.pptx),
+ * búsqueda en internet en vivo para temas actuales y respaldo rápido entre modelos.
  *
  * @param {string} chatId - Identificador del chat (clave en el Map de memoria).
  * @param {string} userMessage - Texto del mensaje entrante.
  * @param {object} [options]
  * @param {string} [options.systemInstruction] - Sobrescribe la instrucción de sistema solo para esta llamada.
  * @param {string} [options.model] - Sobrescribe el modelo solo para esta llamada.
- * @param {object} [options.document] - Resultado de `prepareDocumentForGemini`.
+ * @param {object} [options.document] - Resultado de `prepareDocumentForGemini` (imagen o documento).
+ * @param {boolean} [options.disableWebSearch] - Desactiva la búsqueda web automática si es true.
  * @returns {Promise<string>} Respuesta generada en texto plano.
  */
 export async function generateReply(chatId, userMessage, options = {}) {
@@ -317,13 +360,26 @@ export async function generateReply(chatId, userMessage, options = {}) {
   const primaryModel = options.model || process.env.GEMINI_MODEL || DEFAULT_MODEL;
   const systemInstruction = options.systemInstruction || getSystemInstruction();
 
+  let webContext = null;
+  if (!options.document && !options.disableWebSearch && shouldSearchWeb(userMessage)) {
+    try {
+      webContext = await searchWebLive(userMessage);
+      if (webContext) {
+        console.log('[WebSearch] Contexto actualizado obtenido en vivo.');
+      }
+    } catch (err) {
+      console.warn(`[WebSearch] Error en búsqueda web (se continúa sin búsqueda): ${err.message}`);
+    }
+  }
+
   const history = conversationStore.get(chatId) || [];
-  const { requestStep, historyStep, requiresNativeDocument } = buildUserSteps(
+  const { requestStep, historyStep, requiresNativeMultimodal } = buildUserSteps(
     userMessage,
-    options.document
+    options.document,
+    webContext
   );
 
-  const candidateModels = getOrderedCandidateModels(primaryModel, requiresNativeDocument);
+  const candidateModels = getOrderedCandidateModels(primaryModel, requiresNativeMultimodal);
   const inputSteps = trimHistory([...history, requestStep]);
 
   let interaction = null;

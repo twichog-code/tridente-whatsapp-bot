@@ -118,15 +118,21 @@ export async function extractDocxText(buffer) {
 }
 
 /**
- * Determina el tipo lógico del documento a partir del MIME type y la extensión del archivo.
+ * Determina el tipo lógico del archivo adjunto a partir del MIME type y la extensión.
  * @param {string} [mimeType]
  * @param {string} [fileName]
- * @returns {'pdf' | 'docx' | 'pptx' | 'text' | 'legacy_office' | 'unsupported'}
+ * @returns {'image' | 'pdf' | 'docx' | 'pptx' | 'text' | 'legacy_office' | 'unsupported'}
  */
 export function detectDocumentKind(mimeType = '', fileName = '') {
   const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
   const ext = String(fileName || '').toLowerCase().split('.').pop() || '';
 
+  if (
+    mime.startsWith('image/') ||
+    ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)
+  ) {
+    return 'image';
+  }
   if (mime === MIME_PDF || ext === 'pdf') return 'pdf';
   if (mime === MIME_DOCX || ext === 'docx') return 'docx';
   if (mime === MIME_PPTX || ext === 'pptx') return 'pptx';
@@ -145,7 +151,23 @@ export function detectDocumentKind(mimeType = '', fileName = '') {
 }
 
 /**
- * Prepara un archivo descargado de WhatsApp para enviarlo a Gemini:
+ * Normaliza el MIME type de una imagen para enviarla a Gemini.
+ */
+function resolveImageMimeType(mimeType = '', fileName = '') {
+  const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
+  if (['image/jpeg', 'image/png', 'image/webp', 'image/gif'].includes(mime)) {
+    return mime;
+  }
+  const ext = String(fileName || '').toLowerCase().split('.').pop() || '';
+  if (ext === 'png') return 'image/png';
+  if (ext === 'webp') return 'image/webp';
+  if (ext === 'gif') return 'image/gif';
+  return 'image/jpeg';
+}
+
+/**
+ * Prepara un archivo o imagen descargado de WhatsApp para enviarlo a Gemini:
+ * - Imagen (JPG/PNG/WEBP/GIF) -> visión multimodal nativa
  * - PDF -> envío multimodal nativo (lee texto, tablas e imágenes/gráficos)
  * - Word (.docx) -> extracción limpia de texto con mammoth
  * - PowerPoint (.pptx) -> extracción de diapositivas y notas en orden con adm-zip
@@ -154,11 +176,12 @@ export function detectDocumentKind(mimeType = '', fileName = '') {
  * @param {Buffer} buffer
  * @param {{ mimeType?: string, fileName?: string }} metadata
  * @returns {Promise<
+ *   | { kind: 'native_image', mimeType: string, base64: string, fileName: string }
  *   | { kind: 'native_document', mimeType: string, base64: string, fileName: string }
  *   | { kind: 'extracted_text', format: string, text: string, fileName: string, truncated: boolean }
  * >}
  */
-export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName = 'documento' } = {}) {
+export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName = 'archivo' } = {}) {
   if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
     throw new UnsupportedDocumentError('El archivo llegó vacío o no se pudo descargar.');
   }
@@ -171,6 +194,15 @@ export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName
   }
 
   const kind = detectDocumentKind(mimeType, fileName);
+
+  if (kind === 'image') {
+    return {
+      kind: 'native_image',
+      mimeType: resolveImageMimeType(mimeType, fileName),
+      base64: buffer.toString('base64'),
+      fileName,
+    };
+  }
 
   if (kind === 'pdf') {
     return {
@@ -237,6 +269,6 @@ export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName
   }
 
   throw new UnsupportedDocumentError(
-    `Todavía no puedo leer el formato de "${fileName}". Soporto *PDF*, *Word (.docx)*, *PowerPoint (.pptx)* y archivos de texto (.txt/.csv/.md).`
+    `Todavía no puedo leer el formato de "${fileName}". Soporto *fotos/imágenes*, *PDF*, *Word (.docx)*, *PowerPoint (.pptx)* y texto (.txt/.csv/.md).`
   );
 }

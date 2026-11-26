@@ -11,8 +11,9 @@ whatsapp-gemini-chatbot/
 ├── src/
 │   ├── index.js                      # Servidor Express (process.env.PORT || 3000) con GET /health
 │   └── services/
-│       ├── baileysService.js         # Conexión WhatsApp (activación estricta con `!`, documentos, anti-spam)
-│       ├── documentService.js        # Lectura de PDF (nativo), Word (.docx), PowerPoint (.pptx) y texto
+│       ├── baileysService.js         # Conexión WhatsApp (activación estricta con `!`, fotos, documentos, anti-spam)
+│       ├── documentService.js        # Visión de fotos/imágenes y lectura de PDF, Word (.docx), PowerPoint (.pptx) y texto
+│       ├── webSearchService.js       # Búsqueda web gratuita en vivo (Google News RSS + Wikipedia ES)
 │       ├── supabaseAuthState.js      # Adaptador de sesión de Baileys sobre Supabase (tabla whatsapp_auth)
 │       └── geminiService.js          # Integración @google/genai + razonamiento fuerte + respaldo multi-modelo
 ├── .env.example                      # Plantilla de variables de entorno
@@ -65,10 +66,11 @@ ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
 
 ## 3. Uso del chatbot
 
-- **Activación estricta únicamente con `!`**: el bot responde solo cuando el mensaje (o el texto adjunto a un documento) comienza con **`!`** (ejemplo: `!hola`, `! explica este problema paso a paso`). Mencionar `"tridente"` sin `!` al inicio se ignora.
-- **Lectura de archivos (PDF, Word `.docx` y PowerPoint `.pptx`)**:
-  - Envía el archivo directamente con un comentario que empiece con `!` (ej. `!resúmeme este PDF`), **o**
-  - Responde (citando) a un archivo ya enviado en el chat escribiendo `!analiza este documento`.
+- **Activación estricta únicamente con `!`**: el bot responde solo cuando el mensaje (o el texto adjunto a una foto o documento) comienza con **`!`** (ejemplo: `!hola`, `! explica este problema paso a paso`). Mencionar `"tridente"` sin `!` al inicio se ignora.
+- **Visión de fotos y lectura de archivos (JPG/PNG/WEBP, PDF, Word `.docx` y PowerPoint `.pptx`)**:
+  - Envía la foto o archivo directamente con un comentario que empiece con `!` (ej. `!resuelve este ejercicio`, `!resúmeme este PDF`), **o**
+  - Responde (citando) a una foto o archivo ya enviado en el chat escribiendo `!analiza esto`.
+- **Información actual en tiempo real (internet en vivo)**: se activa automáticamente cuando preguntas por noticias, tasas, eventos recientes o de 2026 (ej. `!quién es la Miss Venezuela 2026`, `!precio del dólar BCV hoy`), o forzándolo con `!busca ...`.
 - **Reiniciar memoria**: envía **`!reset`** para limpiar la memoria de los últimos 20 mensajes del chat.
 
 ---
