@@ -7,6 +7,7 @@ import {
   stopWhatsApp,
 } from './services/baileysService.js';
 import { getModelInfo } from './services/geminiService.js';
+import { getWebSearchMode } from './services/webSearchService.js';
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
@@ -18,6 +19,7 @@ app.get('/health', (_req, res) => {
     service: 'whatsapp-gemini-chatbot',
     whatsapp: getConnectionStatus(),
     authStorage: getAuthStorageMode(),
+    webSearch: getWebSearchMode(),
     model: getModelInfo(),
     timestamp: new Date().toISOString(),
   });

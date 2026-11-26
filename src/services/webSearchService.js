@@ -1,4 +1,4 @@
-const SEARCH_TIMEOUT_MS = 7000;
+const SEARCH_TIMEOUT_MS = 8000;
 const WIKI_USER_AGENT =
   'TridenteWhatsAppBot/1.0 (https://github.com/twichog-code/tridente-whatsapp-bot)';
 
@@ -7,8 +7,19 @@ const EXPLICIT_SEARCH_REGEX = /^(busca|buscar|investiga|investigar|noticias|goog
 const VENEZUELA_CURRENCY_REGEX =
   /(?<![\p{L}\p{N}])(dólar|dolar|dólares|dolares|bcv|paralelo|bolívares|bolivares|bolívar|bolivar|bs\.?|euro|euros|divisa|divisas|tasa\s+de\s+cambio)(?![\p{L}\p{N}])/iu;
 
+const FINANCE_TOPIC_REGEX =
+  /(?<![\p{L}\p{N}])(fondo|fondos|inversión|inversion|inversiones|bolsa|acción|acciones|etf|s&p|nasdaq|dow\s+jones|fed|reserva\s+federal|inflación|inflacion|tasa\s+de\s+interés|tasas\s+de\s+interés|bitcoin|btc|ethereum|eth|cripto|oro|petróleo|petroleo|mercado\s+financiero|wall\s+street|blackrock|vanguard)(?![\p{L}\p{N}])/iu;
+
 const FRESHNESS_QUERY_REGEX =
-  /\b(202[5-9]|203\d|hoy|ayer|anoche|mañana|actual|actualmente|ahora|reciente|recientes|últim[oa]s?|ultim[oa]s?|notici[ao]s?|precio|tasa|dólar|dolar|bcv|euro|bitcoin|btc|clima|tiempo|pronóstico|pronostico|partido|marcador|resultado|resultados|ganó|gano|ganador|ganadora|campeón|campeon|campeona|presidente|presidenta|ministro|miss|mundial|estreno|película|pelicula|vigente|quién\s+es|quien\s+es|cuánto\s+cuesta|cuanto\s+cuesta|cuánto\s+vale|cuanto\s+vale|cuándo\s+es|cuando\s+es|qué\s+pasó|que\s+paso)\b/i;
+  /(?<![\p{L}\p{N}])(202[5-9]|203\d|hoy|ayer|anoche|mañana|actual|actualmente|ahora|reciente|recientes|últim[oa]s?|ultim[oa]s?|notici[ao]s?|precio|precios|tasa|tasas|dólar|dolar|bcv|euro|bitcoin|btc|clima|tiempo|pronóstico|pronostico|partido|marcador|resultado|resultados|ganó|gano|ganador|ganadora|campeón|campeon|campeona|presidente|presidenta|ministro|miss|mundial|estreno|película|pelicula|vigente|quién\s+es|quien\s+es|cuánto\s+cuesta|cuanto\s+cuesta|cuánto\s+vale|cuanto\s+vale|cuándo\s+es|cuando\s+es|qué\s+pasó|que\s+paso)(?![\p{L}\p{N}])/iu;
+
+/**
+ * Devuelve el motor de búsqueda web configurado ('tavily' o 'free_rss').
+ * @returns {'tavily' | 'free_rss'}
+ */
+export function getWebSearchMode() {
+  return process.env.TAVILY_API_KEY?.trim() ? 'tavily' : 'free_rss';
+}
 
 /**
  * Decodifica entidades HTML/XML básicas presentes en feeds RSS y respuestas de Wikipedia.
@@ -57,6 +68,7 @@ export function shouldSearchWeb(prompt) {
 
   if (EXPLICIT_SEARCH_REGEX.test(text)) return true;
   if (VENEZUELA_CURRENCY_REGEX.test(text)) return true;
+  if (FINANCE_TOPIC_REGEX.test(text)) return true;
   if (FRESHNESS_QUERY_REGEX.test(text)) return true;
 
   return false;
@@ -77,7 +89,61 @@ export function buildSearchQuery(prompt) {
     )
     .replace(/\s+/g, ' ')
     .trim()
-    .slice(0, 140);
+    .slice(0, 200);
+}
+
+/**
+ * Búsqueda web completa en todo internet usando Tavily API (`TAVILY_API_KEY`).
+ * Lee resúmenes y fragmentos reales de páginas web actualizadas de todo el mundo.
+ * @param {string} query
+ * @returns {Promise<string | null>}
+ */
+async function fetchTavilySearch(query) {
+  const apiKey = process.env.TAVILY_API_KEY?.trim();
+  if (!apiKey) return null;
+
+  const topic = FINANCE_TOPIC_REGEX.test(query) ? 'finance' : 'general';
+
+  const res = await fetch('https://api.tavily.com/search', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      query,
+      search_depth: 'basic',
+      topic,
+      include_answer: true,
+      max_results: 5,
+    }),
+    signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => res.statusText);
+    throw new Error(`Tavily HTTP ${res.status}: ${errText.slice(0, 160)}`);
+  }
+
+  const data = await res.json();
+  const sections = [];
+
+  if (typeof data.answer === 'string' && data.answer.trim()) {
+    sections.push(`Resumen verificado (Tavily):\n${data.answer.trim()}`);
+  }
+
+  const results = Array.isArray(data.results) ? data.results : [];
+  if (results.length > 0) {
+    const formatted = results.slice(0, 5).map((r, idx) => {
+      const title = r.title || 'Fuente web';
+      const dateStr = r.published_date ? ` (${r.published_date})` : '';
+      const snippet = String(r.content || '').replace(/\s+/g, ' ').trim().slice(0, 500);
+      return `${idx + 1}. ${title}${dateStr}\n   ${snippet}\n   URL: ${r.url || ''}`;
+    });
+    sections.push(`Páginas web encontradas:\n${formatted.join('\n\n')}`);
+  }
+
+  return sections.length > 0 ? sections.join('\n\n') : null;
 }
 
 /**
@@ -162,7 +228,6 @@ async function fetchGoogleNewsRss(query) {
     if (items.length >= 15) break;
   }
 
-  // Priorizar las noticias más recientes (ej. hoy antes que hace 3 días)
   items.sort((a, b) => b.timestamp - a.timestamp);
   return items.slice(0, 8).map(({ title, date }) => ({ title, date }));
 }
@@ -191,7 +256,6 @@ async function fetchWikipediaEs(query) {
     (h) => `${h.title}: ${decodeHtmlEntities(h.snippet)}`
   );
 
-  // Obtener extracto introductorio de los 2 artículos más relevantes
   const titles = hits.slice(0, 2).map((h) => h.title).join('|');
   const extractUrl =
     'https://es.wikipedia.org/w/api.php?action=query&prop=extracts&exintro=1&explaintext=1&exchars=750' +
@@ -220,8 +284,10 @@ async function fetchWikipediaEs(query) {
 }
 
 /**
- * Ejecuta búsqueda en vivo (DolarAPI para tasas BCV/Paralelo, Google News RSS + Wikipedia ES en paralelo)
- * sin requerir API Keys. Devuelve un bloque de contexto para Gemini, o `null` si no hubo resultados.
+ * Ejecuta búsqueda en vivo con prioridad:
+ * 1. Tasas exactas BCV/Paralelo (USD/EUR) vía DolarAPI si preguntan por divisas de Venezuela.
+ * 2. Tavily Search (búsqueda web completa global) si `TAVILY_API_KEY` está configurada.
+ * 3. Respaldo gratuito automático: Google News RSS + Wikipedia ES en paralelo.
  *
  * @param {string} prompt
  * @returns {Promise<string | null>}
@@ -229,7 +295,6 @@ async function fetchWikipediaEs(query) {
 export async function searchWebLive(prompt) {
   const isCurrencyQuery = VENEZUELA_CURRENCY_REGEX.test(prompt);
 
-  // Para consultas de dólar/euro/BCV/bolívares en Venezuela, usar directamente la API oficial en vivo
   if (isCurrencyQuery) {
     try {
       const ratesBlock = await fetchVenezuelaRates();
@@ -241,14 +306,30 @@ export async function searchWebLive(prompt) {
         );
       }
     } catch {
-      // Si falla la API de divisas, cae automáticamente a Google News RSS + Wikipedia
+      // Si falla DolarAPI, continúa con Tavily o Google News RSS
     }
   }
 
   const query = buildSearchQuery(prompt);
   if (!query) return null;
 
-  // Si la consulta menciona 2026 en certámenes/eventos anuales, consultamos también el ciclo 2025/2026 en Wikipedia
+  // Prioridad 1: Tavily (búsqueda web completa global leyendo contenido real de páginas)
+  if (process.env.TAVILY_API_KEY?.trim()) {
+    try {
+      const tavilyBlock = await fetchTavilySearch(query);
+      if (tavilyBlock) {
+        return (
+          `[RESULTADOS DE BÚSQUEDA EN INTERNET EN VIVO (Tavily Web Search) — Consulta: "${query}" | Fecha actual: ${getCurrentDateVenezuela()}]\n` +
+          `${tavilyBlock}\n` +
+          '[FIN DE RESULTADOS DE BÚSQUEDA]'
+        );
+      }
+    } catch (err) {
+      console.warn(`[WebSearch] Falló Tavily (${err.message}); usando respaldo Google News + Wikipedia.`);
+    }
+  }
+
+  // Respaldo gratuito automático: Google News RSS + Wikipedia ES
   const wikiQuery = /\b2026\b/.test(query) ? `${query} 2025` : query;
 
   const [newsRes, wikiRes] = await Promise.allSettled([

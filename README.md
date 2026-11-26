@@ -13,7 +13,7 @@ whatsapp-gemini-chatbot/
 │   └── services/
 │       ├── baileysService.js         # Conexión WhatsApp (activación estricta con `!`, fotos, documentos, anti-spam)
 │       ├── documentService.js        # Visión de fotos/imágenes y lectura de PDF, Word (.docx), PowerPoint (.pptx) y texto
-│       ├── webSearchService.js       # Búsqueda web gratuita en vivo (Google News RSS + Wikipedia ES)
+│       ├── webSearchService.js       # Búsqueda web en vivo (Tavily global + DolarAPI BCV + respaldo Google News/Wikipedia)
 │       ├── supabaseAuthState.js      # Adaptador de sesión de Baileys sobre Supabase (tabla whatsapp_auth)
 │       └── geminiService.js          # Integración @google/genai + razonamiento fuerte + respaldo multi-modelo
 ├── .env.example                      # Plantilla de variables de entorno
@@ -56,6 +56,7 @@ ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
    - `PORT`: puerto del servidor Express (por defecto `3000`).
    - `GEMINI_API_KEY`: clave de Google AI Studio.
    - `SUPABASE_URL` y `SUPABASE_KEY` *(opcionales en local)*: si se definen, la sesión se guarda en la tabla `whatsapp_auth` de Supabase; si se omiten, se guarda localmente en `auth_info/`.
+   - `TAVILY_API_KEY` *(opcional)*: clave gratuita de [Tavily](https://app.tavily.com) (1.000 búsquedas/mes gratis) para búsqueda web completa global; si se omite, usa Google News RSS + Wikipedia ES automáticamente.
    - `WHATSAPP_PAIRING_NUMBER` *(opcional)*: tu número con código de país sin `+` ni espacios para vincular por código de 8 dígitos en vez de QR.
 4. Inicia el bot:
    ```bash
@@ -70,7 +71,9 @@ ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
 - **Visión de fotos y lectura de archivos (JPG/PNG/WEBP, PDF, Word `.docx` y PowerPoint `.pptx`)**:
   - Envía la foto o archivo directamente con un comentario que empiece con `!` (ej. `!resuelve este ejercicio`, `!resúmeme este PDF`), **o**
   - Responde (citando) a una foto o archivo ya enviado en el chat escribiendo `!analiza esto`.
-- **Información actual en tiempo real (internet en vivo)**: se activa automáticamente cuando preguntas por noticias, tasas, eventos recientes o de 2026 (ej. `!quién es la Miss Venezuela 2026`, `!precio del dólar BCV hoy`), o forzándolo con `!busca ...`.
+- **Información actual en tiempo real (internet en vivo)**:
+  - **Divisas en Venezuela**: tasas exactas de Dólar/Euro BCV y Paralelo directo vía DolarAPI.
+  - **Cualquier tema del mundo**: si agregas `TAVILY_API_KEY` lee páginas web completas de todo el mundo; si no, usa Google News RSS + Wikipedia ES automáticamente (también puedes forzar búsqueda con `!busca ...`).
 - **Reiniciar memoria**: envía **`!reset`** para limpiar la memoria de los últimos 20 mensajes del chat.
 
 ---
@@ -86,6 +89,7 @@ ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
    - `GEMINI_API_KEY`
    - `SUPABASE_URL`
    - `SUPABASE_KEY`
-   - *(Opcional)* `GEMINI_MODEL`, `SYSTEM_INSTRUCTION`, `WHATSAPP_PAIRING_NUMBER`
-4. Render asigna `PORT` automáticamente y verifica `GET /health` (`200 OK` con estado de WhatsApp y `authStorage: "supabase"`).
+   - *(Opcional recomendado)* `TAVILY_API_KEY`
+   - *(Opcional)* `WHATSAPP_PAIRING_NUMBER` (puedes quitarla tras vincular)
+4. Render asigna `PORT` automáticamente y verifica `GET /health` (`200 OK` con estado de WhatsApp, `authStorage` y `webSearch`).
 5. En el primer arranque, revisa los logs de Render para obtener el código de 8 dígitos (si pusiste `WHATSAPP_PAIRING_NUMBER`) o el QR; la sesión quedará guardada en Supabase y sobrevivirá reinicios y nuevos despliegues.
