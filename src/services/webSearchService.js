@@ -4,6 +4,9 @@ const WIKI_USER_AGENT =
 
 const EXPLICIT_SEARCH_REGEX = /^(busca|buscar|investiga|investigar|noticias|googlea)\b/i;
 
+const VENEZUELA_CURRENCY_REGEX =
+  /(?<![\p{L}\p{N}])(dólar|dolar|dólares|dolares|bcv|paralelo|bolívares|bolivares|bolívar|bolivar|bs\.?|euro|euros|divisa|divisas|tasa\s+de\s+cambio)(?![\p{L}\p{N}])/iu;
+
 const FRESHNESS_QUERY_REGEX =
   /\b(202[5-9]|203\d|hoy|ayer|anoche|mañana|actual|actualmente|ahora|reciente|recientes|últim[oa]s?|ultim[oa]s?|notici[ao]s?|precio|tasa|dólar|dolar|bcv|euro|bitcoin|btc|clima|tiempo|pronóstico|pronostico|partido|marcador|resultado|resultados|ganó|gano|ganador|ganadora|campeón|campeon|campeona|presidente|presidenta|ministro|miss|mundial|estreno|película|pelicula|vigente|quién\s+es|quien\s+es|cuánto\s+cuesta|cuanto\s+cuesta|cuánto\s+vale|cuanto\s+vale|cuándo\s+es|cuando\s+es|qué\s+pasó|que\s+paso)\b/i;
 
@@ -53,6 +56,7 @@ export function shouldSearchWeb(prompt) {
   if (text.length < 4) return false;
 
   if (EXPLICIT_SEARCH_REGEX.test(text)) return true;
+  if (VENEZUELA_CURRENCY_REGEX.test(text)) return true;
   if (FRESHNESS_QUERY_REGEX.test(text)) return true;
 
   return false;
@@ -74,6 +78,44 @@ export function buildSearchQuery(prompt) {
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 140);
+}
+
+/**
+ * Consulta tasas oficiales (BCV) y paralelo en tiempo real para Venezuela (USD y EUR) vía DolarAPI.
+ * @returns {Promise<string | null>}
+ */
+async function fetchVenezuelaRates() {
+  const [usdRes, eurRes] = await Promise.allSettled([
+    fetch('https://ve.dolarapi.com/v1/dolares', {
+      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    }).then((r) => (r.ok ? r.json() : null)),
+    fetch('https://ve.dolarapi.com/v1/euros', {
+      signal: AbortSignal.timeout(SEARCH_TIMEOUT_MS),
+    }).then((r) => (r.ok ? r.json() : null)),
+  ]);
+
+  const usdList = usdRes.status === 'fulfilled' && Array.isArray(usdRes.value) ? usdRes.value : [];
+  const eurList = eurRes.status === 'fulfilled' && Array.isArray(eurRes.value) ? eurRes.value : [];
+
+  const lines = [];
+  const formatRate = (label, item, unit) => {
+    if (!item || typeof item.promedio !== 'number') return;
+    const updated = item.fechaActualizacion
+      ? new Intl.DateTimeFormat('es-VE', {
+          timeZone: 'America/Caracas',
+          dateStyle: 'medium',
+          timeStyle: 'short',
+        }).format(new Date(item.fechaActualizacion))
+      : 'hoy';
+    lines.push(`- ${label}: ${item.promedio.toFixed(4)} Bs/${unit} (actualizado: ${updated})`);
+  };
+
+  formatRate('Dólar BCV (Oficial)', usdList.find((x) => x.fuente === 'oficial'), 'USD');
+  formatRate('Dólar Paralelo', usdList.find((x) => x.fuente === 'paralelo'), 'USD');
+  formatRate('Euro BCV (Oficial)', eurList.find((x) => x.fuente === 'oficial'), 'EUR');
+  formatRate('Euro Paralelo', eurList.find((x) => x.fuente === 'paralelo'), 'EUR');
+
+  return lines.length > 0 ? lines.join('\n') : null;
 }
 
 /**
@@ -128,7 +170,7 @@ async function fetchGoogleNewsRss(query) {
 /**
  * Consulta Wikipedia en español (búsqueda + extracto introductorio del artículo más relevante).
  * @param {string} query
- * @returns {Promise<{ topTitle: string, extract: string, snippets: string[] } | null>}
+ * @returns {Promise<{ extracts: string[], snippets: string[] } | null>}
  */
 async function fetchWikipediaEs(query) {
   const searchUrl =
@@ -178,13 +220,31 @@ async function fetchWikipediaEs(query) {
 }
 
 /**
- * Ejecuta búsqueda en vivo (Google News RSS + Wikipedia ES en paralelo) sin requerir API Keys.
- * Devuelve un bloque de contexto listo para inyectar a Gemini, o `null` si no hubo resultados.
+ * Ejecuta búsqueda en vivo (DolarAPI para tasas BCV/Paralelo, Google News RSS + Wikipedia ES en paralelo)
+ * sin requerir API Keys. Devuelve un bloque de contexto para Gemini, o `null` si no hubo resultados.
  *
  * @param {string} prompt
  * @returns {Promise<string | null>}
  */
 export async function searchWebLive(prompt) {
+  const isCurrencyQuery = VENEZUELA_CURRENCY_REGEX.test(prompt);
+
+  // Para consultas de dólar/euro/BCV/bolívares en Venezuela, usar directamente la API oficial en vivo
+  if (isCurrencyQuery) {
+    try {
+      const ratesBlock = await fetchVenezuelaRates();
+      if (ratesBlock) {
+        return (
+          `[RESULTADOS DE BÚSQUEDA EN INTERNET EN VIVO — Tasas de Cambio Venezuela (DolarAPI / BCV) | Fecha actual: ${getCurrentDateVenezuela()}]\n` +
+          `Tasas exactas vigentes ahora mismo:\n${ratesBlock}\n` +
+          '[FIN DE RESULTADOS DE BÚSQUEDA]'
+        );
+      }
+    } catch {
+      // Si falla la API de divisas, cae automáticamente a Google News RSS + Wikipedia
+    }
+  }
+
   const query = buildSearchQuery(prompt);
   if (!query) return null;
 
