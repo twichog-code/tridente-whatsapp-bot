@@ -4,14 +4,38 @@ const WIKI_USER_AGENT =
 
 const EXPLICIT_SEARCH_REGEX = /^(busca|buscar|investiga|investigar|noticias|googlea)\b/i;
 
-const VENEZUELA_CURRENCY_REGEX =
-  /(?<![\p{L}\p{N}])(dólar|dolar|dólares|dolares|bcv|paralelo|bolívares|bolivares|bolívar|bolivar|bs\.?|euro|euros|divisa|divisas|tasa\s+de\s+cambio)(?![\p{L}\p{N}])/iu;
+const VENEZUELA_EXPLICIT_CURRENCY_REGEX =
+  /(?<![\p{L}\p{N}])(bcv|paralelo|bolívares|bolivares|bolívar|bolivar|bs\.?|tasa\s+de\s+cambio|divisa|divisas)(?![\p{L}\p{N}])/iu;
+
+const GENERAL_CURRENCY_WORD_REGEX =
+  /(?<![\p{L}\p{N}])(dólar|dolar|dólares|dolares|euro|euros)(?![\p{L}\p{N}])/iu;
 
 const FINANCE_TOPIC_REGEX =
   /(?<![\p{L}\p{N}])(fondo|fondos|inversión|inversion|inversiones|bolsa|acción|acciones|etf|s&p|nasdaq|dow\s+jones|fed|reserva\s+federal|inflación|inflacion|tasa\s+de\s+interés|tasas\s+de\s+interés|bitcoin|btc|ethereum|eth|cripto|oro|petróleo|petroleo|mercado\s+financiero|wall\s+street|blackrock|vanguard)(?![\p{L}\p{N}])/iu;
 
 const FRESHNESS_QUERY_REGEX =
   /(?<![\p{L}\p{N}])(202[5-9]|203\d|hoy|ayer|anoche|mañana|actual|actualmente|ahora|reciente|recientes|últim[oa]s?|ultim[oa]s?|notici[ao]s?|precio|precios|tasa|tasas|dólar|dolar|bcv|euro|bitcoin|btc|clima|tiempo|pronóstico|pronostico|partido|marcador|resultado|resultados|ganó|gano|ganador|ganadora|campeón|campeon|campeona|presidente|presidenta|ministro|miss|mundial|estreno|película|pelicula|vigente|quién\s+es|quien\s+es|cuánto\s+cuesta|cuanto\s+cuesta|cuánto\s+vale|cuanto\s+vale|cuándo\s+es|cuando\s+es|qué\s+pasó|que\s+paso)(?![\p{L}\p{N}])/iu;
+
+/**
+ * Determina si el mensaje pregunta específicamente por las tasas de cambio en Venezuela (BCV/Paralelo).
+ * Evita secuestrar preguntas globales como "precio del bitcoin en dólares" o "fondos en dólares de EE.UU.".
+ * @param {string} text
+ * @returns {boolean}
+ */
+function isVenezuelaCurrencyQuery(text) {
+  if (VENEZUELA_EXPLICIT_CURRENCY_REGEX.test(text)) return true;
+  if (!GENERAL_CURRENCY_WORD_REGEX.test(text)) return false;
+  // Si menciona temas financieros globales (bitcoin, fondos, acciones, petróleo, etc.) o países/productos externos, dejar que Tavily responda
+  if (FINANCE_TOPIC_REGEX.test(text)) return false;
+  if (
+    /(?<![\p{L}\p{N}])(estados\s+unidos|ee\.?uu\.?|europa|españa|colombia|méxico|mexico|argentina|chile|perú|peru|brasil|iphone|samsung|carro|casa|play\s*station|ps5|xbox|laptop|vuelo|pasaje)(?![\p{L}\p{N}])/iu.test(
+      text
+    )
+  ) {
+    return false;
+  }
+  return true;
+}
 
 /**
  * Devuelve el motor de búsqueda web configurado ('tavily' o 'free_rss').
@@ -36,8 +60,14 @@ function decodeHtmlEntities(text) {
     .replace(/&quot;/g, '"')
     .replace(/&#39;|&apos;/g, "'")
     .replace(/&nbsp;/g, ' ')
-    .replace(/&#(\d+);/g, (_m, code) => String.fromCodePoint(Number(code)))
-    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_m, code) => {
+      const cp = Number(code);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+    })
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => {
+      const cp = parseInt(hex, 16);
+      return cp >= 0 && cp <= 0x10ffff ? String.fromCodePoint(cp) : '';
+    })
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -67,7 +97,7 @@ export function shouldSearchWeb(prompt) {
   if (text.length < 4) return false;
 
   if (EXPLICIT_SEARCH_REGEX.test(text)) return true;
-  if (VENEZUELA_CURRENCY_REGEX.test(text)) return true;
+  if (isVenezuelaCurrencyQuery(text)) return true;
   if (FINANCE_TOPIC_REGEX.test(text)) return true;
   if (FRESHNESS_QUERY_REGEX.test(text)) return true;
 
@@ -166,13 +196,17 @@ async function fetchVenezuelaRates() {
   const lines = [];
   const formatRate = (label, item, unit) => {
     if (!item || typeof item.promedio !== 'number') return;
-    const updated = item.fechaActualizacion
-      ? new Intl.DateTimeFormat('es-VE', {
+    let updated = 'hoy';
+    if (item.fechaActualizacion) {
+      const parsedDate = new Date(item.fechaActualizacion);
+      if (!Number.isNaN(parsedDate.getTime())) {
+        updated = new Intl.DateTimeFormat('es-VE', {
           timeZone: 'America/Caracas',
           dateStyle: 'medium',
           timeStyle: 'short',
-        }).format(new Date(item.fechaActualizacion))
-      : 'hoy';
+        }).format(parsedDate);
+      }
+    }
     lines.push(`- ${label}: ${item.promedio.toFixed(4)} Bs/${unit} (actualizado: ${updated})`);
   };
 
@@ -293,7 +327,7 @@ async function fetchWikipediaEs(query) {
  * @returns {Promise<string | null>}
  */
 export async function searchWebLive(prompt) {
-  const isCurrencyQuery = VENEZUELA_CURRENCY_REGEX.test(prompt);
+  const isCurrencyQuery = isVenezuelaCurrencyQuery(prompt);
 
   if (isCurrencyQuery) {
     try {

@@ -116,7 +116,7 @@ async function resolveLatestWaVersion() {
 }
 
 /**
- * Desenvuelve wrappers de mensajes efímeros, visualización única o documentos con caption.
+ * Desenvuelve recursivamente wrappers de mensajes efímeros, visualización única o documentos con caption.
  * @param {object} rawContent
  * @returns {object | null}
  */
@@ -124,17 +124,20 @@ function unwrapMessageContent(rawContent) {
   let content = rawContent;
   if (!content) return null;
 
-  if (content.ephemeralMessage?.message) {
-    content = content.ephemeralMessage.message;
-  }
-  if (content.viewOnceMessage?.message) {
-    content = content.viewOnceMessage.message;
-  }
-  if (content.viewOnceMessageV2?.message) {
-    content = content.viewOnceMessageV2.message;
-  }
-  if (content.documentWithCaptionMessage?.message) {
-    content = content.documentWithCaptionMessage.message;
+  for (let depth = 0; depth < 6; depth++) {
+    if (content.ephemeralMessage?.message) {
+      content = content.ephemeralMessage.message;
+    } else if (content.viewOnceMessage?.message) {
+      content = content.viewOnceMessage.message;
+    } else if (content.viewOnceMessageV2?.message) {
+      content = content.viewOnceMessageV2.message;
+    } else if (content.viewOnceMessageV2Extension?.message) {
+      content = content.viewOnceMessageV2Extension.message;
+    } else if (content.documentWithCaptionMessage?.message) {
+      content = content.documentWithCaptionMessage.message;
+    } else {
+      break;
+    }
   }
 
   return content;
@@ -162,9 +165,9 @@ export function extractMessageText(msg) {
 }
 
 /**
- * Extrae metadatos unificados de un documento, foto, video o nota de video circular (`ptvMessage`).
+ * Extrae metadatos unificados de un documento, foto, video, nota de video (`ptvMessage`) o audio/nota de voz (`audioMessage`).
  * @param {object} unwrappedContent
- * @returns {{ mediaKind: 'document' | 'image' | 'video', mimetype: string, fileName: string, fileLength: number } | null}
+ * @returns {{ mediaKind: 'document' | 'image' | 'video' | 'audio', mimetype: string, fileName: string, fileLength: number } | null}
  */
 function pickMediaMetadata(unwrappedContent) {
   if (unwrappedContent?.documentMessage) {
@@ -194,11 +197,30 @@ function pickMediaMetadata(unwrappedContent) {
       fileLength: Number(vid.fileLength || 0),
     };
   }
+  if (unwrappedContent?.audioMessage) {
+    const aud = unwrappedContent.audioMessage;
+    const isVoiceNote = Boolean(aud.ptt);
+    const mime = String(aud.mimetype || 'audio/ogg; codecs=opus').toLowerCase();
+    let ext = 'ogg';
+    if (!isVoiceNote) {
+      if (mime.includes('mpeg') || mime.includes('mp3')) ext = 'mp3';
+      else if (mime.includes('mp4') || mime.includes('m4a')) ext = 'm4a';
+      else if (mime.includes('wav')) ext = 'wav';
+      else if (mime.includes('aac')) ext = 'aac';
+      else if (mime.includes('flac')) ext = 'flac';
+    }
+    return {
+      mediaKind: 'audio',
+      mimetype: aud.mimetype || 'audio/ogg; codecs=opus',
+      fileName: isVoiceNote ? 'nota_de_voz.ogg' : `audio.${ext}`,
+      fileLength: Number(aud.fileLength || 0),
+    };
+  }
   return null;
 }
 
 /**
- * Busca si el mensaje actual adjunta una foto/video/documento o responde/cita uno previo.
+ * Busca si el mensaje actual adjunta una foto/video/audio/documento o responde/cita uno previo.
  * @param {object} msg
  * @returns {{ targetMsg: object, docMsg: { mediaKind: string, mimetype: string, fileName: string, fileLength: number } } | null}
  */
@@ -206,7 +228,7 @@ export function extractDocumentSource(msg) {
   const content = unwrapMessageContent(msg?.message);
   if (!content) return null;
 
-  // Caso 1: foto, video o documento enviado directamente (con caption iniciando en `!`)
+  // Caso 1: foto, video, audio o documento enviado directamente (con caption iniciando en `!`)
   const directMeta = pickMediaMetadata(content);
   if (directMeta) {
     return {
@@ -215,7 +237,7 @@ export function extractDocumentSource(msg) {
     };
   }
 
-  // Caso 2: respuesta/cita a un mensaje previo que contenía foto, video o documento
+  // Caso 2: respuesta/cita a un mensaje previo que contenía foto, video, audio o documento
   const contextInfo = content.extendedTextMessage?.contextInfo;
   if (contextInfo?.quotedMessage) {
     const quotedContent = unwrapMessageContent(contextInfo.quotedMessage);
@@ -249,6 +271,18 @@ function normalizeJidUser(jid) {
 }
 
 /**
+ * Guarda un valor en un Map acotado para evitar crecimiento ilimitado de RAM en Render.
+ */
+function setBoundedMap(map, key, value, maxSize) {
+  if (map.has(key)) map.delete(key);
+  map.set(key, value);
+  while (map.size > maxSize) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+}
+
+/**
  * Registra pasivamente el nombre visible (`pushName`) de cada participante en grupos
  * para reconocer siempre a varias personas incluso al responder/citar mensajes anteriores.
  * @param {object} msg
@@ -258,7 +292,7 @@ function rememberGroupParticipant(msg) {
   const userId = normalizeJidUser(participantJid);
   const name = msg?.pushName?.trim();
   if (userId && name) {
-    participantNames.set(userId, name);
+    setBoundedMap(participantNames, userId, name, 2000);
   }
 }
 
@@ -291,7 +325,7 @@ export function resolveSenderInfo(sock, msg, isGroup) {
   const pushName = msg?.pushName?.trim();
 
   if (pushName) {
-    participantNames.set(senderId, pushName);
+    setBoundedMap(participantNames, senderId, pushName, 2000);
     return { senderId, senderName: pushName };
   }
 
@@ -465,7 +499,7 @@ function checkRateLimit(remoteJid, senderId) {
     return false;
   }
 
-  lastReplyBySender.set(senderKey, now);
+  setBoundedMap(lastReplyBySender, senderKey, now, 1000);
   recentGlobalReplyTimestamps.push(now);
   return true;
 }
@@ -474,9 +508,13 @@ function checkRateLimit(remoteJid, senderId) {
  * Procesa el comando `!sticker` / `!s` (a partir de una foto directa/citada o de texto).
  */
 async function handleStickerCommand(sock, { remoteJid, stickerText, docSource, quotedTarget }) {
-  // Caso 1: Foto adjunta o citada -> convertir a sticker WebP 512x512
+  // Caso 1: Foto adjunta o citada (o imagen enviada como documento) -> convertir a sticker WebP 512x512
   if (docSource) {
-    if (docSource.docMsg.mediaKind !== 'image') {
+    const isImage =
+      docSource.docMsg.mediaKind === 'image' ||
+      String(docSource.docMsg.mimetype || '').toLowerCase().startsWith('image/');
+
+    if (!isImage) {
       await sendBotReply(
         sock,
         remoteJid,
@@ -531,7 +569,7 @@ async function handleStickerCommand(sock, { remoteJid, stickerText, docSource, q
 
 /**
  * Procesa mensajes entrantes y responde ÚNICAMENTE cuando el texto (o caption del archivo)
- * empieza con `!`. Soporta multi-persona en grupos, stickers, videos, fotos y PDF/Word/PPTX.
+ * empieza con `!`. Soporta multi-persona en grupos, stickers, videos, notas de video, audios, fotos y PDF/Word/PPTX.
  * @param {object} sock
  * @param {object} msg
  */
@@ -624,7 +662,7 @@ async function handleIncomingMessage(sock, msg) {
       });
     }
 
-    const quotedContext = isGroup && !docSource ? extractQuotedTextContext(msg) : '';
+    const quotedContext = !docSource ? extractQuotedTextContext(msg) : '';
 
     const reply = await generateReply(remoteJid, prompt, {
       document: preparedDocument,
@@ -655,12 +693,31 @@ async function handleIncomingMessage(sock, msg) {
 }
 
 /**
+ * Limpia listeners y cierra el socket anterior antes de abrir uno nuevo (evita respuestas duplicadas al reconectar).
+ */
+function disposeActiveSocket() {
+  if (!activeSocket) return;
+  try {
+    activeSocket.ev?.removeAllListeners?.('creds.update');
+    activeSocket.ev?.removeAllListeners?.('connection.update');
+    activeSocket.ev?.removeAllListeners?.('messages.upsert');
+    activeSocket.end(undefined);
+  } catch {
+    // Ignorar errores al limpiar un socket ya cerrado
+  }
+  activeSocket = null;
+}
+
+/**
  * Inicia la conexión con WhatsApp usando Baileys, muestra el QR en terminal
  * (o solicita código de emparejamiento de 8 dígitos si se define WHATSAPP_PAIRING_NUMBER)
  * y reconecta automáticamente ante desconexiones inesperadas.
  */
 export async function startWhatsApp() {
   isShuttingDown = false;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  disposeActiveSocket();
   connectionStatus = 'connecting';
 
   const { state, saveCreds } = await resolveAuthState();
@@ -681,9 +738,15 @@ export async function startWhatsApp() {
   const pairingNumber = (process.env.WHATSAPP_PAIRING_NUMBER || '').replace(/\D/g, '');
   let pairingCodeRequested = false;
 
-  sock.ev.on('creds.update', saveCreds);
+  // Guardar actualizaciones de credenciales capturando cualquier fallo transitorio sin tumbar el proceso
+  sock.ev.on('creds.update', () => {
+    Promise.resolve(saveCreds()).catch((err) => {
+      console.error('[WhatsApp] Error guardando credenciales de sesión:', err?.message || err);
+    });
+  });
 
   sock.ev.on('connection.update', async (update) => {
+    if (sock !== activeSocket) return;
     const { connection, lastDisconnect, qr } = update;
 
     if (qr) {
@@ -770,7 +833,7 @@ export async function startWhatsApp() {
   });
 
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify' || !Array.isArray(messages)) return;
+    if (sock !== activeSocket || type !== 'notify' || !Array.isArray(messages)) return;
 
     await Promise.allSettled(messages.map((msg) => handleIncomingMessage(sock, msg)));
   });
@@ -785,15 +848,6 @@ export function stopWhatsApp() {
   isShuttingDown = true;
   clearTimeout(reconnectTimer);
   reconnectTimer = null;
-
-  if (activeSocket) {
-    try {
-      activeSocket.end(undefined);
-    } catch {
-      // Ignorar errores al cerrar un socket ya cerrado
-    }
-    activeSocket = null;
-  }
-
+  disposeActiveSocket();
   connectionStatus = 'disconnected';
 }

@@ -122,7 +122,7 @@ export async function extractDocxText(buffer) {
  * Determina el tipo lógico del archivo adjunto a partir del MIME type y la extensión.
  * @param {string} [mimeType]
  * @param {string} [fileName]
- * @returns {'image' | 'video' | 'pdf' | 'docx' | 'pptx' | 'text' | 'legacy_office' | 'unsupported'}
+ * @returns {'image' | 'video' | 'audio' | 'pdf' | 'docx' | 'pptx' | 'text' | 'legacy_office' | 'unsupported'}
  */
 export function detectDocumentKind(mimeType = '', fileName = '') {
   const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
@@ -139,6 +139,12 @@ export function detectDocumentKind(mimeType = '', fileName = '') {
     ['mp4', 'mov', 'webm', 'mpeg', 'mpg', 'avi', '3gp', '3gpp'].includes(ext)
   ) {
     return 'video';
+  }
+  if (
+    mime.startsWith('audio/') ||
+    ['ogg', 'oga', 'opus', 'mp3', 'wav', 'm4a', 'aac', 'flac', 'aiff'].includes(ext)
+  ) {
+    return 'audio';
   }
   if (mime === MIME_PDF || ext === 'pdf') return 'pdf';
   if (mime === MIME_DOCX || ext === 'docx') return 'docx';
@@ -198,9 +204,41 @@ function resolveVideoMimeType(mimeType = '', fileName = '') {
 }
 
 /**
- * Prepara un archivo, imagen o video descargado de WhatsApp para enviarlo a Gemini:
+ * Normaliza el MIME type de un audio o nota de voz de WhatsApp (`audio/ogg; codecs=opus`) para Gemini.
+ */
+function resolveAudioMimeType(mimeType = '', fileName = '') {
+  const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
+  const supported = [
+    'audio/ogg',
+    'audio/mp3',
+    'audio/mpeg',
+    'audio/wav',
+    'audio/m4a',
+    'audio/aac',
+    'audio/flac',
+    'audio/aiff',
+    'audio/opus',
+    'audio/webm',
+  ];
+  if (supported.includes(mime)) {
+    return mime;
+  }
+  if (mime === 'audio/mp4' || mime === 'audio/x-m4a') return 'audio/m4a';
+  if (mime === 'audio/x-wav') return 'audio/wav';
+  const ext = String(fileName || '').toLowerCase().split('.').pop() || '';
+  if (ext === 'mp3') return 'audio/mp3';
+  if (ext === 'wav') return 'audio/wav';
+  if (ext === 'm4a') return 'audio/m4a';
+  if (ext === 'aac') return 'audio/aac';
+  if (ext === 'flac') return 'audio/flac';
+  return 'audio/ogg';
+}
+
+/**
+ * Prepara un archivo, imagen, video o audio descargado de WhatsApp para enviarlo a Gemini:
  * - Imagen (JPG/PNG/WEBP/GIF) -> visión multimodal nativa
  * - Video (MP4/MOV/WEBM/3GPP) -> análisis multimodal nativo (video + audio)
+ * - Audio / Nota de voz (OGG/OPUS/MP3/WAV/M4A/AAC/FLAC) -> escucha/transcripción nativa
  * - PDF -> envío multimodal nativo (lee texto, tablas e imágenes/gráficos)
  * - Word (.docx) -> extracción limpia de texto con mammoth
  * - PowerPoint (.pptx) -> extracción de diapositivas y notas en orden con adm-zip
@@ -211,6 +249,7 @@ function resolveVideoMimeType(mimeType = '', fileName = '') {
  * @returns {Promise<
  *   | { kind: 'native_image', mimeType: string, base64: string, fileName: string }
  *   | { kind: 'native_video', mimeType: string, base64: string, fileName: string }
+ *   | { kind: 'native_audio', mimeType: string, base64: string, fileName: string }
  *   | { kind: 'native_document', mimeType: string, base64: string, fileName: string }
  *   | { kind: 'extracted_text', format: string, text: string, fileName: string, truncated: boolean }
  * >}
@@ -243,6 +282,15 @@ export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName
     return {
       kind: 'native_video',
       mimeType: resolveVideoMimeType(mimeType, fileName),
+      base64: buffer.toString('base64'),
+      fileName,
+    };
+  }
+
+  if (kind === 'audio') {
+    return {
+      kind: 'native_audio',
+      mimeType: resolveAudioMimeType(mimeType, fileName),
       base64: buffer.toString('base64'),
       fileName,
     };
@@ -313,6 +361,6 @@ export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName
   }
 
   throw new UnsupportedDocumentError(
-    `Todavía no puedo leer el formato de "${fileName}". Soporto *fotos*, *videos*, *PDF*, *Word (.docx)*, *PowerPoint (.pptx)* y texto (.txt/.csv/.md).`
+    `Todavía no puedo leer el formato de "${fileName}". Soporto *fotos*, *videos*, *audios/notas de voz*, *PDF*, *Word (.docx)*, *PowerPoint (.pptx)* y texto (.txt/.csv/.md).`
   );
 }

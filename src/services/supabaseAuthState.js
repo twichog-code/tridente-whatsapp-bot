@@ -48,6 +48,16 @@ function deserializeFromJsonb(raw) {
  * @param {string} [options.sessionPrefix=''] - Prefijo opcional para soportar múltiples sesiones en la misma tabla.
  * @returns {Promise<{ state: { creds: any, keys: { get: Function, set: Function } }, saveCreds: Function }>}
  */
+const BATCH_SIZE = 100;
+
+function chunkArray(items, size) {
+  const chunks = [];
+  for (let i = 0; i < items.length; i += size) {
+    chunks.push(items.slice(i, i + size));
+  }
+  return chunks;
+}
+
 export async function useSupabaseAuthState(supabaseUrl, supabaseKey, options = {}) {
   if (!supabaseUrl || !supabaseKey) {
     throw new Error('SUPABASE_URL y SUPABASE_KEY son obligatorias para usar useSupabaseAuthState.');
@@ -66,12 +76,18 @@ export async function useSupabaseAuthState(supabaseUrl, supabaseKey, options = {
 
   const writeRow = async (key, value) => {
     const id = buildId(key);
-    const { error } = await supabase
-      .from(tableName)
-      .upsert({ id, data: serializeForJsonb(value) }, { onConflict: 'id' });
+    const payload = { id, data: serializeForJsonb(value) };
 
-    if (error) {
-      throw new Error(`Error guardando "${id}" en Supabase (${tableName}): ${error.message}`);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const { error } = await supabase
+        .from(tableName)
+        .upsert(payload, { onConflict: 'id' });
+
+      if (!error) return;
+      if (attempt === 2) {
+        throw new Error(`Error guardando "${id}" en Supabase (${tableName}): ${error.message}`);
+      }
+      await new Promise((r) => setTimeout(r, 500));
     }
   };
 
@@ -109,24 +125,26 @@ export async function useSupabaseAuthState(supabaseUrl, supabaseKey, options = {
             return dbId;
           });
 
-          const { data: rows, error } = await supabase
-            .from(tableName)
-            .select('id, data')
-            .in('id', dbIds);
+          for (const batch of chunkArray(dbIds, BATCH_SIZE)) {
+            const { data: rows, error } = await supabase
+              .from(tableName)
+              .select('id, data')
+              .in('id', batch);
 
-          if (error) {
-            throw new Error(`Error consultando llaves "${type}" en Supabase: ${error.message}`);
-          }
-
-          for (const row of rows || []) {
-            const originalId = dbIdToKeyId.get(row.id);
-            if (!originalId) continue;
-
-            let value = deserializeFromJsonb(row.data);
-            if (type === 'app-state-sync-key' && value) {
-              value = proto.Message.AppStateSyncKeyData.fromObject(value);
+            if (error) {
+              throw new Error(`Error consultando llaves "${type}" en Supabase: ${error.message}`);
             }
-            result[originalId] = value;
+
+            for (const row of rows || []) {
+              const originalId = dbIdToKeyId.get(row.id);
+              if (!originalId) continue;
+
+              let value = deserializeFromJsonb(row.data);
+              if (type === 'app-state-sync-key' && value) {
+                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+              }
+              result[originalId] = value;
+            }
           }
 
           return result;
@@ -154,11 +172,11 @@ export async function useSupabaseAuthState(supabaseUrl, supabaseKey, options = {
 
           const tasks = [];
 
-          if (rowsToUpsert.length > 0) {
+          for (const batch of chunkArray(rowsToUpsert, BATCH_SIZE)) {
             tasks.push(
               supabase
                 .from(tableName)
-                .upsert(rowsToUpsert, { onConflict: 'id' })
+                .upsert(batch, { onConflict: 'id' })
                 .then(({ error }) => {
                   if (error) {
                     throw new Error(`Error guardando llaves en Supabase: ${error.message}`);
@@ -167,12 +185,12 @@ export async function useSupabaseAuthState(supabaseUrl, supabaseKey, options = {
             );
           }
 
-          if (idsToDelete.length > 0) {
+          for (const batch of chunkArray(idsToDelete, BATCH_SIZE)) {
             tasks.push(
               supabase
                 .from(tableName)
                 .delete()
-                .in('id', idsToDelete)
+                .in('id', batch)
                 .then(({ error }) => {
                   if (error) {
                     throw new Error(`Error eliminando llaves en Supabase: ${error.message}`);

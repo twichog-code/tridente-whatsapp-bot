@@ -16,6 +16,7 @@ const FALLBACK_MODELS = [
   'gemma-4-26b-a4b-it',
 ];
 const REQUEST_TIMEOUT_MS = 35_000;
+const AUDIO_REQUEST_TIMEOUT_MS = 45_000;
 const VIDEO_REQUEST_TIMEOUT_MS = 60_000;
 const COOLDOWN_404_MS = 30 * 60 * 1000; // 30 min si el modelo no existe en el endpoint
 const COOLDOWN_429_MS = 10 * 60 * 1000; // 10 min si excede cuota/rate limit
@@ -26,7 +27,7 @@ const DEFAULT_SYSTEM_INSTRUCTION = [
   'Razonamiento lógico y precisión (PRIORIDAD MÁXIMA):',
   '- Piensa con rigor lógico paso a paso antes de contestar: modela el estado inicial y cada cambio con cuidado, comprueba cálculos matemáticos, código y relaciones causa-efecto, y valida tu conclusión final antes de escribirla.',
   '- Nunca respondas a la ligera ni inventes datos ni supongas contradicciones donde no existen. Si falta un dato para resolver algo, dilo claro.',
-  '- Cuando recibas una imagen/foto, un video o un documento (PDF, Word o PowerPoint), analízalo completo con atención (escenas, audio hablado en videos, texto manuscrito, ecuaciones, capturas, tablas o diapositivas), basa tu respuesta en su contenido real y avisa si algo no se distingue bien.',
+  '- Cuando recibas una imagen/foto, un video, un audio/nota de voz o un documento (PDF, Word o PowerPoint), analízalo completo con atención (voz hablada, escenas, texto manuscrito, ecuaciones, capturas, tablas o diapositivas), basa tu respuesta en su contenido real y avisa si algo no se distingue bien.',
   '- Cuando recibas un bloque [RESULTADOS DE BÚSQUEDA EN INTERNET EN VIVO], PRIORIZA siempre esa información actual y sus fechas sobre tu memoria de entrenamiento vieja. Si los titulares o resúmenes contienen cifras, tasas (como una tasa BCV publicada el día anterior vigente para hoy), ganadores o hechos recientes, cítalos directamente con su fecha exacta en lugar de decir que no tienes el dato.',
   'Conversaciones en grupos:',
   '- En grupos de WhatsApp, cada mensaje indica quién habla con el encabezado `[Grupo | Habla: Nombre]` (y opcionalmente `[Citando a OtroNombre: "..."]`).',
@@ -35,15 +36,16 @@ const DEFAULT_SYSTEM_INSTRUCTION = [
   '- Hablas como un venezolano de verdad escribiendo por WhatsApp: natural, pilas, cercano y con buena chispa (usas expresiones como "épale", "qué más", "pana", "chévere", "fino", "dale", "brutal", "al pelo", "de una", etc. solo cuando fluyan natural — jamás forzado ni caricaturesco).',
   '- Jamás uses modismos de otros países como "qué onda", "wey", "chido", "refri", "tío" ni "vos".',
   '- CERO tono robótico ni de call center: PROHIBIDO decir "¡Claro que sí!", "¡Por supuesto!", "Como asistente virtual...", "Excelente pregunta" ni rematar cada mensaje con "¿En qué más te puedo ayudar hoy?".',
-  '- Adapta la extensión a lo que haga falta: en charla casual sé ágil y directo (2-4 líneas); en problemas lógicos, preguntas técnicas o análisis de fotos/videos/documentos, tómate el espacio necesario para dar una respuesta impecable, clara y bien organizada.',
+  '- Adapta la extensión a lo que haga falta: en charla casual sé ágil y directo (2-4 líneas); en problemas lógicos, preguntas técnicas o análisis de fotos/videos/audios/documentos, tómate el espacio necesario para dar una respuesta impecable, clara y bien organizada.',
   '- No te presentes en cada mensaje; solo di que te llamas Tridente si te preguntan quién eres o en un primer saludo.',
   '- En WhatsApp las negritas van con UN solo asterisco (*así*), nunca con doble asterisco (**no**).',
 ].join('\n');
 
 const MAX_HISTORY_MESSAGES = 24;
+const MAX_ACTIVE_CHATS = 200;
 const MAX_HISTORY_DOC_EXCERPT = 2500;
 
-// Memoria de conversación en memoria: Map<chatJid, Array<InteractionStep>>
+// Memoria de conversación en memoria (con tope LRU de 200 chats): Map<chatJid, Array<InteractionStep>>
 const conversationStore = new Map();
 // Enfriamiento temporal por modelo que falló recientemente: Map<model, timestampMs>
 const modelCooldownUntil = new Map();
@@ -121,6 +123,20 @@ export function clearConversationHistory(chatId) {
 }
 
 /**
+ * Guarda el historial manteniendo un límite máximo de chats activos (evita fugas de memoria en Render).
+ */
+function saveConversationHistory(chatId, steps) {
+  if (conversationStore.has(chatId)) {
+    conversationStore.delete(chatId);
+  }
+  conversationStore.set(chatId, steps);
+  while (conversationStore.size > MAX_ACTIVE_CHATS) {
+    const oldestKey = conversationStore.keys().next().value;
+    conversationStore.delete(oldestKey);
+  }
+}
+
+/**
  * Recorta el historial para conservar como máximo los últimos `MAX_HISTORY_MESSAGES` mensajes,
  * asegurando que la ventana siempre comience con un mensaje de usuario (`user_input`).
  * @param {Array<object>} history
@@ -136,7 +152,7 @@ function trimHistory(history) {
 
 /**
  * Ordena los modelos candidatos priorizando los que no estén en enfriamiento.
- * Si la solicitud lleva contenido multimodal nativo (PDF, imagen o video), prioriza modelos Gemini.
+ * Si la solicitud lleva contenido multimodal nativo (PDF, imagen, audio o video), prioriza modelos Gemini.
  * @param {string} primaryModel
  * @param {boolean} requiresNativeMultimodal
  * @returns {string[]}
@@ -249,7 +265,7 @@ function formatSpeakerPrompt(userMessage, { isGroup = false, senderName = '', qu
 }
 
 /**
- * Construye el paso `user_input` para enviar en esta llamada (con imagen, video, documento o búsqueda web)
+ * Construye el paso `user_input` para enviar en esta llamada (con imagen, video, audio, documento o búsqueda web)
  * y la versión ligera para guardar en memoria.
  */
 function buildUserSteps(formattedPrompt, document, webContext) {
@@ -268,7 +284,7 @@ function buildUserSteps(formattedPrompt, document, webContext) {
         content: [{ type: 'text', text: formattedPrompt }],
       },
       requiresNativeMultimodal: false,
-      isVideo: false,
+      timeoutMs: REQUEST_TIMEOUT_MS,
     };
   }
 
@@ -298,7 +314,37 @@ function buildUserSteps(formattedPrompt, document, webContext) {
         ],
       },
       requiresNativeMultimodal: true,
-      isVideo: false,
+      timeoutMs: REQUEST_TIMEOUT_MS,
+    };
+  }
+
+  if (document.kind === 'native_audio') {
+    return {
+      requestStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'audio',
+            mime_type: document.mimeType,
+            data: document.base64,
+          },
+          {
+            type: 'text',
+            text: `Audio/nota de voz adjunto: "${document.fileName}".\n${enrichedPrompt}`,
+          },
+        ],
+      },
+      historyStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'text',
+            text: `[Audio adjunto: "${document.fileName}"]\n${formattedPrompt}`,
+          },
+        ],
+      },
+      requiresNativeMultimodal: true,
+      timeoutMs: AUDIO_REQUEST_TIMEOUT_MS,
     };
   }
 
@@ -328,7 +374,7 @@ function buildUserSteps(formattedPrompt, document, webContext) {
         ],
       },
       requiresNativeMultimodal: true,
-      isVideo: true,
+      timeoutMs: VIDEO_REQUEST_TIMEOUT_MS,
     };
   }
 
@@ -358,7 +404,7 @@ function buildUserSteps(formattedPrompt, document, webContext) {
         ],
       },
       requiresNativeMultimodal: true,
-      isVideo: false,
+      timeoutMs: REQUEST_TIMEOUT_MS,
     };
   }
 
@@ -390,21 +436,21 @@ function buildUserSteps(formattedPrompt, document, webContext) {
       content: [{ type: 'text', text: historyText }],
     },
     requiresNativeMultimodal: false,
-    isVideo: false,
+    timeoutMs: REQUEST_TIMEOUT_MS,
   };
 }
 
 /**
  * Genera una respuesta de Gemini manteniendo los últimos 24 mensajes por chat.
  * Soporta reconocimiento multi-persona en grupos, visión de imágenes y videos,
- * lectura de PDF/Word/PowerPoint, búsqueda en internet en vivo y respaldo entre modelos.
+ * escucha de audios/notas de voz, lectura de PDF/Word/PowerPoint, búsqueda web y respaldo entre modelos.
  *
  * @param {string} chatId - Identificador del chat (clave en el Map de memoria).
  * @param {string} userMessage - Texto del mensaje entrante.
  * @param {object} [options]
  * @param {string} [options.systemInstruction] - Sobrescribe la instrucción de sistema solo para esta llamada.
  * @param {string} [options.model] - Sobrescribe el modelo solo para esta llamada.
- * @param {object} [options.document] - Resultado de `prepareDocumentForGemini` (imagen, video o documento).
+ * @param {object} [options.document] - Resultado de `prepareDocumentForGemini` (imagen, video, audio o documento).
  * @param {boolean} [options.isGroup] - Indica si el chat es un grupo.
  * @param {string} [options.senderName] - Nombre visible de quien envió el mensaje en el grupo.
  * @param {string} [options.quotedContext] - Texto citado opcional (ej. `[Citando a Carlos: "..."]`).
@@ -430,7 +476,7 @@ export async function generateReply(chatId, userMessage, options = {}) {
 
   const formattedPrompt = formatSpeakerPrompt(userMessage, options);
   const history = conversationStore.get(chatId) || [];
-  const { requestStep, historyStep, requiresNativeMultimodal, isVideo } = buildUserSteps(
+  const { requestStep, historyStep, requiresNativeMultimodal, timeoutMs } = buildUserSteps(
     formattedPrompt,
     options.document,
     webContext
@@ -438,7 +484,6 @@ export async function generateReply(chatId, userMessage, options = {}) {
 
   const candidateModels = getOrderedCandidateModels(primaryModel, requiresNativeMultimodal);
   const inputSteps = trimHistory([...history, requestStep]);
-  const timeoutMs = isVideo ? VIDEO_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
 
   let interaction = null;
   let lastError = null;
@@ -477,7 +522,7 @@ export async function generateReply(chatId, userMessage, options = {}) {
     content: [{ type: 'text', text: replyText }],
   };
 
-  conversationStore.set(chatId, trimHistory([...history, historyStep, modelStep]));
+  saveConversationHistory(chatId, trimHistory([...history, historyStep, modelStep]));
 
   return replyText;
 }

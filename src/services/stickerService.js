@@ -59,7 +59,7 @@ export async function createStickerFromImage(imageBuffer) {
     throw new Error('No se recibió una imagen válida para crear el sticker.');
   }
 
-  const qualities = [80, 60, 42];
+  const qualities = [80, 60, 42, 25];
   let webpBuffer = null;
 
   for (const quality of qualities) {
@@ -93,25 +93,25 @@ export async function createStickerFromText(rawText) {
     throw new Error('Escribe un texto después de !sticker para generar el sticker.');
   }
 
-  let fontSize = 78;
+  let fontSize = 68;
   let maxCharsPerLine = 11;
 
   if (cleanText.length > 55) {
-    fontSize = 48;
+    fontSize = 42;
     maxCharsPerLine = 18;
   } else if (cleanText.length > 28) {
-    fontSize = 60;
+    fontSize = 50;
     maxCharsPerLine = 15;
   } else if (cleanText.length > 14) {
-    fontSize = 68;
+    fontSize = 58;
     maxCharsPerLine = 13;
   }
 
   const lines = wrapTextLines(cleanText, maxCharsPerLine);
-  const lineHeight = Math.round(fontSize * 1.22);
+  const lineHeight = Math.round(fontSize * 1.24);
   const totalHeight = lines.length * lineHeight;
   const startY = Math.round((STICKER_SIZE - totalHeight) / 2 + fontSize * 0.85);
-  const strokeWidth = Math.max(8, Math.round(fontSize * 0.16));
+  const strokeWidth = Math.max(7, Math.round(fontSize * 0.16));
 
   const textElements = lines
     .map((line, index) => {

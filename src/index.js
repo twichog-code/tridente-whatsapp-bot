@@ -59,13 +59,20 @@ const server = app.listen(PORT, () => {
   });
 });
 
+let isShuttingDown = false;
+
 function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
   console.log(`\n[Server] Señal ${signal} recibida. Cerrando servicios...`);
   stopWhatsApp();
   server.close(() => {
     console.log('[Server] Servidor detenido correctamente.');
     process.exit(0);
   });
+  setTimeout(() => {
+    process.exit(0);
+  }, 5000).unref();
 }
 
 process.on('SIGINT', () => shutdown('SIGINT'));

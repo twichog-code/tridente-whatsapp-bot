@@ -73,9 +73,9 @@ ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
 - **Stickers (`!sticker` o `!s`)**:
   - Envía o cita una **foto** con `!sticker` (o `!s`) para convertirla en sticker WebP 512×512.
   - Escribe `!sticker tu frase` (o `!s Fino`) para crear un sticker de texto al instante.
-- **Visión de fotos, videos y lectura de archivos (JPG/PNG/WEBP, MP4/MOV/WEBM, PDF, Word `.docx` y PowerPoint `.pptx`)**:
+- **Visión de fotos, videos, notas de video, audios/notas de voz y lectura de archivos (JPG/PNG/WEBP, MP4/MOV/WEBM, OGG/MP3/WAV/M4A, PDF, Word `.docx` y PowerPoint `.pptx`)**:
   - Envía la foto, video (hasta 18 MB) o archivo directamente con un comentario que empiece con `!` (ej. `!qué pasa en este video?`, `!resúmeme este PDF`), **o**
-  - Responde (citando) a una foto, video o archivo ya enviado en el chat escribiendo `!analiza esto`.
+  - Responde (citando) a una foto, video, nota de video circular, nota de voz/audio o archivo ya enviado en el chat escribiendo `!transcribe este audio` / `!analiza esto`.
 - **Información actual en tiempo real (internet en vivo)**:
   - **Divisas en Venezuela**: tasas exactas de Dólar/Euro BCV y Paralelo directo vía DolarAPI.
   - **Cualquier tema del mundo**: si agregas `TAVILY_API_KEY` lee páginas web completas de todo el mundo; si no, usa Google News RSS + Wikipedia ES automáticamente (también puedes forzar búsqueda con `!busca ...`).
