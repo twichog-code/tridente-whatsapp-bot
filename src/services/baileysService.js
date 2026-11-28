@@ -154,6 +154,7 @@ export function extractMessageText(msg) {
     content.extendedTextMessage?.text ||
     content.imageMessage?.caption ||
     content.videoMessage?.caption ||
+    content.ptvMessage?.caption ||
     content.documentMessage?.caption ||
     null;
 
@@ -161,7 +162,7 @@ export function extractMessageText(msg) {
 }
 
 /**
- * Extrae metadatos unificados de un documento, foto o video dentro de un mensaje desenvuelto.
+ * Extrae metadatos unificados de un documento, foto, video o nota de video circular (`ptvMessage`).
  * @param {object} unwrappedContent
  * @returns {{ mediaKind: 'document' | 'image' | 'video', mimetype: string, fileName: string, fileLength: number } | null}
  */
@@ -184,12 +185,12 @@ function pickMediaMetadata(unwrappedContent) {
       fileLength: Number(img.fileLength || 0),
     };
   }
-  if (unwrappedContent?.videoMessage) {
-    const vid = unwrappedContent.videoMessage;
+  const vid = unwrappedContent?.videoMessage || unwrappedContent?.ptvMessage;
+  if (vid) {
     return {
       mediaKind: 'video',
       mimetype: vid.mimetype || 'video/mp4',
-      fileName: 'video.mp4',
+      fileName: unwrappedContent?.ptvMessage ? 'nota_de_video.mp4' : 'video.mp4',
       fileLength: Number(vid.fileLength || 0),
     };
   }
