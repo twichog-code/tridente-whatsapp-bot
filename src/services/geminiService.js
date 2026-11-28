@@ -16,6 +16,7 @@ const FALLBACK_MODELS = [
   'gemma-4-26b-a4b-it',
 ];
 const REQUEST_TIMEOUT_MS = 35_000;
+const VIDEO_REQUEST_TIMEOUT_MS = 60_000;
 const COOLDOWN_404_MS = 30 * 60 * 1000; // 30 min si el modelo no existe en el endpoint
 const COOLDOWN_429_MS = 10 * 60 * 1000; // 10 min si excede cuota/rate limit
 const COOLDOWN_503_MS = 60 * 1000; // 1 min si hay saturación temporal o timeout
@@ -25,18 +26,21 @@ const DEFAULT_SYSTEM_INSTRUCTION = [
   'Razonamiento lógico y precisión (PRIORIDAD MÁXIMA):',
   '- Piensa con rigor lógico paso a paso antes de contestar: modela el estado inicial y cada cambio con cuidado, comprueba cálculos matemáticos, código y relaciones causa-efecto, y valida tu conclusión final antes de escribirla.',
   '- Nunca respondas a la ligera ni inventes datos ni supongas contradicciones donde no existen. Si falta un dato para resolver algo, dilo claro.',
-  '- Cuando recibas una imagen/foto o documento (PDF, Word o PowerPoint), analízalo completo con atención (lee texto manuscrito, ecuaciones, capturas, tablas o diapositivas), basa tu respuesta en su contenido real y avisa si algo no se distingue bien.',
+  '- Cuando recibas una imagen/foto, un video o un documento (PDF, Word o PowerPoint), analízalo completo con atención (escenas, audio hablado en videos, texto manuscrito, ecuaciones, capturas, tablas o diapositivas), basa tu respuesta en su contenido real y avisa si algo no se distingue bien.',
   '- Cuando recibas un bloque [RESULTADOS DE BÚSQUEDA EN INTERNET EN VIVO], PRIORIZA siempre esa información actual y sus fechas sobre tu memoria de entrenamiento vieja. Si los titulares o resúmenes contienen cifras, tasas (como una tasa BCV publicada el día anterior vigente para hoy), ganadores o hechos recientes, cítalos directamente con su fecha exacta en lugar de decir que no tienes el dato.',
+  'Conversaciones en grupos:',
+  '- En grupos de WhatsApp, cada mensaje indica quién habla con el encabezado `[Grupo | Habla: Nombre]` (y opcionalmente `[Citando a OtroNombre: "..."]`).',
+  '- Reconoce siempre a cada persona por separado por su nombre, recuerda qué dijo, pidió o comentó cada participante sin confundirlos entre sí, y dirígete naturalmente a quien te acaba de hablar.',
   'Voz y estilo venezolano real:',
   '- Hablas como un venezolano de verdad escribiendo por WhatsApp: natural, pilas, cercano y con buena chispa (usas expresiones como "épale", "qué más", "pana", "chévere", "fino", "dale", "brutal", "al pelo", "de una", etc. solo cuando fluyan natural — jamás forzado ni caricaturesco).',
   '- Jamás uses modismos de otros países como "qué onda", "wey", "chido", "refri", "tío" ni "vos".',
   '- CERO tono robótico ni de call center: PROHIBIDO decir "¡Claro que sí!", "¡Por supuesto!", "Como asistente virtual...", "Excelente pregunta" ni rematar cada mensaje con "¿En qué más te puedo ayudar hoy?".',
-  '- Adapta la extensión a lo que haga falta: en charla casual sé ágil y directo (2-4 líneas); en problemas lógicos, preguntas técnicas o análisis de fotos/documentos, tómate el espacio necesario para dar una respuesta impecable, clara y bien organizada.',
+  '- Adapta la extensión a lo que haga falta: en charla casual sé ágil y directo (2-4 líneas); en problemas lógicos, preguntas técnicas o análisis de fotos/videos/documentos, tómate el espacio necesario para dar una respuesta impecable, clara y bien organizada.',
   '- No te presentes en cada mensaje; solo di que te llamas Tridente si te preguntan quién eres o en un primer saludo.',
   '- En WhatsApp las negritas van con UN solo asterisco (*así*), nunca con doble asterisco (**no**).',
 ].join('\n');
 
-const MAX_HISTORY_MESSAGES = 20;
+const MAX_HISTORY_MESSAGES = 24;
 const MAX_HISTORY_DOC_EXCERPT = 2500;
 
 // Memoria de conversación en memoria: Map<chatJid, Array<InteractionStep>>
@@ -132,7 +136,7 @@ function trimHistory(history) {
 
 /**
  * Ordena los modelos candidatos priorizando los que no estén en enfriamiento.
- * Si la solicitud lleva contenido multimodal nativo (PDF o imagen), prioriza modelos Gemini.
+ * Si la solicitud lleva contenido multimodal nativo (PDF, imagen o video), prioriza modelos Gemini.
  * @param {string} primaryModel
  * @param {boolean} requiresNativeMultimodal
  * @returns {string[]}
@@ -206,22 +210,22 @@ function buildRequestParams(model, systemInstruction, inputSteps) {
 /**
  * Llama a Interactions API sin reintentos internos lentos del SDK para cambiar rápido al respaldo.
  */
-async function createInteractionFast(client, params) {
+async function createInteractionFast(client, params, timeoutMs = REQUEST_TIMEOUT_MS) {
   let timer;
   try {
     return await Promise.race([
       client.interactions.create(params, {
         retries: { strategy: 'none' },
-        timeout_ms: REQUEST_TIMEOUT_MS,
+        timeout_ms: timeoutMs,
       }),
       new Promise((_, reject) => {
         timer = setTimeout(() => {
           const err = new Error(
-            `Tiempo de espera agotado (${REQUEST_TIMEOUT_MS}ms) para ${params.model}`
+            `Tiempo de espera agotado (${timeoutMs}ms) para ${params.model}`
           );
           err.status = 504;
           reject(err);
-        }, REQUEST_TIMEOUT_MS);
+        }, timeoutMs);
       }),
     ]);
   } finally {
@@ -230,13 +234,28 @@ async function createInteractionFast(client, params) {
 }
 
 /**
- * Construye el paso `user_input` para enviar en esta llamada (con imagen, documento o búsqueda web)
+ * Formatea el mensaje del usuario incluyendo identidad del hablante en grupos y cita si aplica.
+ */
+function formatSpeakerPrompt(userMessage, { isGroup = false, senderName = '', quotedContext = '' } = {}) {
+  const lines = [];
+  if (isGroup && senderName) {
+    lines.push(`[Grupo | Habla: ${senderName}]`);
+  }
+  if (quotedContext) {
+    lines.push(quotedContext);
+  }
+  lines.push(userMessage);
+  return lines.join('\n');
+}
+
+/**
+ * Construye el paso `user_input` para enviar en esta llamada (con imagen, video, documento o búsqueda web)
  * y la versión ligera para guardar en memoria.
  */
-function buildUserSteps(userMessage, document, webContext) {
+function buildUserSteps(formattedPrompt, document, webContext) {
   const enrichedPrompt = webContext
-    ? `${webContext}\n\nPregunta del usuario: ${userMessage}`
-    : userMessage;
+    ? `${webContext}\n\n${formattedPrompt}`
+    : formattedPrompt;
 
   if (!document) {
     return {
@@ -246,9 +265,10 @@ function buildUserSteps(userMessage, document, webContext) {
       },
       historyStep: {
         type: 'user_input',
-        content: [{ type: 'text', text: userMessage }],
+        content: [{ type: 'text', text: formattedPrompt }],
       },
       requiresNativeMultimodal: false,
+      isVideo: false,
     };
   }
 
@@ -273,11 +293,42 @@ function buildUserSteps(userMessage, document, webContext) {
         content: [
           {
             type: 'text',
-            text: `[Imagen adjunta: "${document.fileName}"]\n${userMessage}`,
+            text: `[Imagen adjunta: "${document.fileName}"]\n${formattedPrompt}`,
           },
         ],
       },
       requiresNativeMultimodal: true,
+      isVideo: false,
+    };
+  }
+
+  if (document.kind === 'native_video') {
+    return {
+      requestStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'video',
+            mime_type: document.mimeType,
+            data: document.base64,
+          },
+          {
+            type: 'text',
+            text: `Video adjunto: "${document.fileName}".\n${enrichedPrompt}`,
+          },
+        ],
+      },
+      historyStep: {
+        type: 'user_input',
+        content: [
+          {
+            type: 'text',
+            text: `[Video adjunto: "${document.fileName}"]\n${formattedPrompt}`,
+          },
+        ],
+      },
+      requiresNativeMultimodal: true,
+      isVideo: true,
     };
   }
 
@@ -293,7 +344,7 @@ function buildUserSteps(userMessage, document, webContext) {
           },
           {
             type: 'text',
-            text: `Archivo adjunto: "${document.fileName}".\nSolicitud del usuario: ${enrichedPrompt}`,
+            text: `Archivo adjunto: "${document.fileName}".\n${enrichedPrompt}`,
           },
         ],
       },
@@ -302,11 +353,12 @@ function buildUserSteps(userMessage, document, webContext) {
         content: [
           {
             type: 'text',
-            text: `[PDF adjunto: "${document.fileName}"]\n${userMessage}`,
+            text: `[PDF adjunto: "${document.fileName}"]\n${formattedPrompt}`,
           },
         ],
       },
       requiresNativeMultimodal: true,
+      isVideo: false,
     };
   }
 
@@ -317,7 +369,7 @@ function buildUserSteps(userMessage, document, webContext) {
   const fullText =
     `[Documento ${document.format}: "${document.fileName}"]\n` +
     `--- INICIO DEL CONTENIDO ---\n${document.text}${truncationNote}\n--- FIN DEL CONTENIDO ---\n\n` +
-    `Solicitud del usuario: ${enrichedPrompt}`;
+    `${enrichedPrompt}`;
 
   const excerpt =
     document.text.length > MAX_HISTORY_DOC_EXCERPT
@@ -326,7 +378,7 @@ function buildUserSteps(userMessage, document, webContext) {
 
   const historyText =
     `[Documento ${document.format}: "${document.fileName}"]\n` +
-    `Extracto:\n${excerpt}\n\nSolicitud del usuario: ${userMessage}`;
+    `Extracto:\n${excerpt}\n\n${formattedPrompt}`;
 
   return {
     requestStep: {
@@ -338,20 +390,24 @@ function buildUserSteps(userMessage, document, webContext) {
       content: [{ type: 'text', text: historyText }],
     },
     requiresNativeMultimodal: false,
+    isVideo: false,
   };
 }
 
 /**
- * Genera una respuesta de Gemini manteniendo los últimos 20 mensajes por chat.
- * Soporta visión de imágenes/fotos, PDF nativo, Word (.docx), PowerPoint (.pptx),
- * búsqueda en internet en vivo para temas actuales y respaldo rápido entre modelos.
+ * Genera una respuesta de Gemini manteniendo los últimos 24 mensajes por chat.
+ * Soporta reconocimiento multi-persona en grupos, visión de imágenes y videos,
+ * lectura de PDF/Word/PowerPoint, búsqueda en internet en vivo y respaldo entre modelos.
  *
  * @param {string} chatId - Identificador del chat (clave en el Map de memoria).
  * @param {string} userMessage - Texto del mensaje entrante.
  * @param {object} [options]
  * @param {string} [options.systemInstruction] - Sobrescribe la instrucción de sistema solo para esta llamada.
  * @param {string} [options.model] - Sobrescribe el modelo solo para esta llamada.
- * @param {object} [options.document] - Resultado de `prepareDocumentForGemini` (imagen o documento).
+ * @param {object} [options.document] - Resultado de `prepareDocumentForGemini` (imagen, video o documento).
+ * @param {boolean} [options.isGroup] - Indica si el chat es un grupo.
+ * @param {string} [options.senderName] - Nombre visible de quien envió el mensaje en el grupo.
+ * @param {string} [options.quotedContext] - Texto citado opcional (ej. `[Citando a Carlos: "..."]`).
  * @param {boolean} [options.disableWebSearch] - Desactiva la búsqueda web automática si es true.
  * @returns {Promise<string>} Respuesta generada en texto plano.
  */
@@ -372,15 +428,17 @@ export async function generateReply(chatId, userMessage, options = {}) {
     }
   }
 
+  const formattedPrompt = formatSpeakerPrompt(userMessage, options);
   const history = conversationStore.get(chatId) || [];
-  const { requestStep, historyStep, requiresNativeMultimodal } = buildUserSteps(
-    userMessage,
+  const { requestStep, historyStep, requiresNativeMultimodal, isVideo } = buildUserSteps(
+    formattedPrompt,
     options.document,
     webContext
   );
 
   const candidateModels = getOrderedCandidateModels(primaryModel, requiresNativeMultimodal);
   const inputSteps = trimHistory([...history, requestStep]);
+  const timeoutMs = isVideo ? VIDEO_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS;
 
   let interaction = null;
   let lastError = null;
@@ -388,7 +446,7 @@ export async function generateReply(chatId, userMessage, options = {}) {
   for (const model of candidateModels) {
     try {
       const params = buildRequestParams(model, systemInstruction, inputSteps);
-      interaction = await createInteractionFast(client, params);
+      interaction = await createInteractionFast(client, params, timeoutMs);
       modelCooldownUntil.delete(model);
       lastUsedModel = model;
       if (model !== primaryModel) {

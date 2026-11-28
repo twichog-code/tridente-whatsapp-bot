@@ -11,8 +11,9 @@ whatsapp-gemini-chatbot/
 ├── src/
 │   ├── index.js                      # Servidor Express (process.env.PORT || 3000) con GET /health
 │   └── services/
-│       ├── baileysService.js         # Conexión WhatsApp (activación estricta con `!`, fotos, documentos, anti-spam)
-│       ├── documentService.js        # Visión de fotos/imágenes y lectura de PDF, Word (.docx), PowerPoint (.pptx) y texto
+│       ├── baileysService.js         # Conexión WhatsApp (! estricto, grupos multi-persona, fotos/videos/docs, stickers)
+│       ├── documentService.js        # Visión de fotos/videos y lectura de PDF, Word (.docx), PowerPoint (.pptx) y texto
+│       ├── stickerService.js         # Generador de stickers WebP 512x512 desde fotos o texto (sharp)
 │       ├── webSearchService.js       # Búsqueda web en vivo (Tavily global + DolarAPI BCV + respaldo Google News/Wikipedia)
 │       ├── supabaseAuthState.js      # Adaptador de sesión de Baileys sobre Supabase (tabla whatsapp_auth)
 │       └── geminiService.js          # Integración @google/genai + razonamiento fuerte + respaldo multi-modelo
@@ -67,14 +68,18 @@ ALTER TABLE whatsapp_auth ENABLE ROW LEVEL SECURITY;
 
 ## 3. Uso del chatbot
 
-- **Activación estricta únicamente con `!`**: el bot responde solo cuando el mensaje (o el texto adjunto a una foto o documento) comienza con **`!`** (ejemplo: `!hola`, `! explica este problema paso a paso`). Mencionar `"tridente"` sin `!` al inicio se ignora.
-- **Visión de fotos y lectura de archivos (JPG/PNG/WEBP, PDF, Word `.docx` y PowerPoint `.pptx`)**:
-  - Envía la foto o archivo directamente con un comentario que empiece con `!` (ej. `!resuelve este ejercicio`, `!resúmeme este PDF`), **o**
-  - Responde (citando) a una foto o archivo ya enviado en el chat escribiendo `!analiza esto`.
+- **Activación estricta únicamente con `!`**: el bot responde solo cuando el mensaje (o el texto adjunto a una foto, video o documento) comienza con **`!`** (ejemplo: `!hola`, `! explica este problema paso a paso`). Mencionar `"tridente"` sin `!` al inicio se ignora.
+- **Grupos con múltiples personas**: reconoce a cada participante por su nombre, mantiene contexto de citas entre usuarios y permite que varios hablen sin bloquearse entre sí.
+- **Stickers (`!sticker` o `!s`)**:
+  - Envía o cita una **foto** con `!sticker` (o `!s`) para convertirla en sticker WebP 512×512.
+  - Escribe `!sticker tu frase` (o `!s Fino`) para crear un sticker de texto al instante.
+- **Visión de fotos, videos y lectura de archivos (JPG/PNG/WEBP, MP4/MOV/WEBM, PDF, Word `.docx` y PowerPoint `.pptx`)**:
+  - Envía la foto, video (hasta 18 MB) o archivo directamente con un comentario que empiece con `!` (ej. `!qué pasa en este video?`, `!resúmeme este PDF`), **o**
+  - Responde (citando) a una foto, video o archivo ya enviado en el chat escribiendo `!analiza esto`.
 - **Información actual en tiempo real (internet en vivo)**:
   - **Divisas en Venezuela**: tasas exactas de Dólar/Euro BCV y Paralelo directo vía DolarAPI.
   - **Cualquier tema del mundo**: si agregas `TAVILY_API_KEY` lee páginas web completas de todo el mundo; si no, usa Google News RSS + Wikipedia ES automáticamente (también puedes forzar búsqueda con `!busca ...`).
-- **Reiniciar memoria**: envía **`!reset`** para limpiar la memoria de los últimos 20 mensajes del chat.
+- **Reiniciar memoria**: envía **`!reset`** para limpiar la memoria de los últimos 24 mensajes del chat.
 
 ---
 

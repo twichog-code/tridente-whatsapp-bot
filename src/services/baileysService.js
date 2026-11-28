@@ -9,6 +9,7 @@ import makeWASocket, {
 import qrcode from 'qrcode-terminal';
 import {
   MAX_DOCUMENT_BYTES,
+  MAX_VIDEO_BYTES,
   UnsupportedDocumentError,
   prepareDocumentForGemini,
 } from './documentService.js';
@@ -16,13 +17,18 @@ import {
   clearConversationHistory,
   generateReply,
 } from './geminiService.js';
+import {
+  createStickerFromImage,
+  createStickerFromText,
+} from './stickerService.js';
 import { useSupabaseAuthState } from './supabaseAuthState.js';
 
 const AUTH_DIR = 'auth_info';
 const INITIAL_RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30_000;
 const COMMAND_PREFIX = '!';
-const MIN_CHAT_INTERVAL_MS = 3000;
+const STICKER_CMD_REGEX = /^(sticker|s)(?:\s+([\s\S]+))?$/i;
+const MIN_USER_INTERVAL_MS = 3000;
 const MAX_REPLIES_PER_MINUTE = 15;
 
 let activeSocket = null;
@@ -34,8 +40,10 @@ let authStorageMode = 'local';
 
 const sentByBotIds = new Set();
 const recentBotReplies = new Map();
-const lastReplyByChat = new Map();
+const lastReplyBySender = new Map();
 const recentGlobalReplyTimestamps = [];
+// Caché pasivo de nombres visibles de participantes en grupos: Map<participantUser, pushName>
+const participantNames = new Map();
 
 /**
  * Logger mínimo compatible con ILogger de Baileys v7:
@@ -133,7 +141,7 @@ function unwrapMessageContent(rawContent) {
 }
 
 /**
- * Extrae el texto plano (o caption de foto/documento) de un mensaje de Baileys.
+ * Extrae el texto plano (o caption de foto/video/documento) de un mensaje de Baileys.
  * @param {object} msg
  * @returns {string | null}
  */
@@ -145,6 +153,7 @@ export function extractMessageText(msg) {
     content.conversation ||
     content.extendedTextMessage?.text ||
     content.imageMessage?.caption ||
+    content.videoMessage?.caption ||
     content.documentMessage?.caption ||
     null;
 
@@ -152,14 +161,15 @@ export function extractMessageText(msg) {
 }
 
 /**
- * Extrae metadatos unificados de un documento o imagen dentro de un mensaje desenvuelto.
+ * Extrae metadatos unificados de un documento, foto o video dentro de un mensaje desenvuelto.
  * @param {object} unwrappedContent
- * @returns {{ mimetype: string, fileName: string, fileLength: number } | null}
+ * @returns {{ mediaKind: 'document' | 'image' | 'video', mimetype: string, fileName: string, fileLength: number } | null}
  */
 function pickMediaMetadata(unwrappedContent) {
   if (unwrappedContent?.documentMessage) {
     const doc = unwrappedContent.documentMessage;
     return {
+      mediaKind: 'document',
       mimetype: doc.mimetype || '',
       fileName: doc.fileName || 'documento',
       fileLength: Number(doc.fileLength || 0),
@@ -168,24 +178,34 @@ function pickMediaMetadata(unwrappedContent) {
   if (unwrappedContent?.imageMessage) {
     const img = unwrappedContent.imageMessage;
     return {
+      mediaKind: 'image',
       mimetype: img.mimetype || 'image/jpeg',
       fileName: 'foto.jpg',
       fileLength: Number(img.fileLength || 0),
+    };
+  }
+  if (unwrappedContent?.videoMessage) {
+    const vid = unwrappedContent.videoMessage;
+    return {
+      mediaKind: 'video',
+      mimetype: vid.mimetype || 'video/mp4',
+      fileName: 'video.mp4',
+      fileLength: Number(vid.fileLength || 0),
     };
   }
   return null;
 }
 
 /**
- * Busca si el mensaje actual adjunta una foto/documento o responde/cita un mensaje con foto/documento.
+ * Busca si el mensaje actual adjunta una foto/video/documento o responde/cita uno previo.
  * @param {object} msg
- * @returns {{ targetMsg: object, docMsg: { mimetype: string, fileName: string, fileLength: number } } | null}
+ * @returns {{ targetMsg: object, docMsg: { mediaKind: string, mimetype: string, fileName: string, fileLength: number } } | null}
  */
 export function extractDocumentSource(msg) {
   const content = unwrapMessageContent(msg?.message);
   if (!content) return null;
 
-  // Caso 1: foto o documento enviado directamente en este mensaje (con caption iniciando en `!`)
+  // Caso 1: foto, video o documento enviado directamente (con caption iniciando en `!`)
   const directMeta = pickMediaMetadata(content);
   if (directMeta) {
     return {
@@ -194,7 +214,7 @@ export function extractDocumentSource(msg) {
     };
   }
 
-  // Caso 2: respuesta/cita a un mensaje previo que contenía una foto o documento
+  // Caso 2: respuesta/cita a un mensaje previo que contenía foto, video o documento
   const contextInfo = content.extendedTextMessage?.contextInfo;
   if (contextInfo?.quotedMessage) {
     const quotedContent = unwrapMessageContent(contextInfo.quotedMessage);
@@ -215,6 +235,95 @@ export function extractDocumentSource(msg) {
   }
 
   return null;
+}
+
+/**
+ * Extrae el identificador base de un JID (sin sufijo `:XX` ni dominio `@...`).
+ * @param {string} jid
+ * @returns {string}
+ */
+function normalizeJidUser(jid) {
+  if (!jid || typeof jid !== 'string') return '';
+  return jid.split('@')[0].split(':')[0];
+}
+
+/**
+ * Registra pasivamente el nombre visible (`pushName`) de cada participante en grupos
+ * para reconocer siempre a varias personas incluso al responder/citar mensajes anteriores.
+ * @param {object} msg
+ */
+function rememberGroupParticipant(msg) {
+  const participantJid = msg?.key?.participant || msg?.key?.participantAlt;
+  const userId = normalizeJidUser(participantJid);
+  const name = msg?.pushName?.trim();
+  if (userId && name) {
+    participantNames.set(userId, name);
+  }
+}
+
+/**
+ * Resuelve el ID y nombre legible de quien habla (clave para distinguir múltiples personas en grupos).
+ * @param {object} sock
+ * @param {object} msg
+ * @param {boolean} isGroup
+ * @returns {{ senderId: string, senderName: string }}
+ */
+export function resolveSenderInfo(sock, msg, isGroup) {
+  if (msg?.key?.fromMe) {
+    const ownId =
+      normalizeJidUser(sock?.user?.id) ||
+      normalizeJidUser(sock?.authState?.creds?.me?.id) ||
+      'owner';
+    const ownName =
+      msg?.pushName?.trim() ||
+      sock?.user?.name?.trim() ||
+      sock?.authState?.creds?.me?.name?.trim() ||
+      'Tú (Dueño)';
+    return { senderId: ownId, senderName: ownName };
+  }
+
+  const rawSenderJid = isGroup
+    ? msg?.key?.participant || msg?.key?.participantAlt || msg?.key?.remoteJid
+    : msg?.key?.remoteJid;
+
+  const senderId = normalizeJidUser(rawSenderJid) || 'desconocido';
+  const pushName = msg?.pushName?.trim();
+
+  if (pushName) {
+    participantNames.set(senderId, pushName);
+    return { senderId, senderName: pushName };
+  }
+
+  const cachedName = participantNames.get(senderId);
+  if (cachedName) {
+    return { senderId, senderName: cachedName };
+  }
+
+  return {
+    senderId,
+    senderName: `Participante ${senderId.slice(-4) || 'anónimo'}`,
+  };
+}
+
+/**
+ * Si el mensaje cita un mensaje de texto previo en un grupo, extrae quién lo dijo y qué decía.
+ * @param {object} msg
+ * @returns {string}
+ */
+export function extractQuotedTextContext(msg) {
+  const content = unwrapMessageContent(msg?.message);
+  const contextInfo = content?.extendedTextMessage?.contextInfo;
+  if (!contextInfo?.quotedMessage) return '';
+
+  const quotedText = extractMessageText({ message: contextInfo.quotedMessage });
+  if (!quotedText) return '';
+
+  const quotedUserId = normalizeJidUser(contextInfo.participant);
+  const quotedAuthor =
+    (quotedUserId && participantNames.get(quotedUserId)) ||
+    (quotedUserId ? `Participante ${quotedUserId.slice(-4)}` : 'otro mensaje');
+
+  return `[Citando a ${quotedAuthor}: "${quotedText.slice(0, 300)}"]`;
 }
 
 /**
@@ -244,6 +353,20 @@ export function extractTriggeredPrompt(rawText) {
 
   const prompt = trimmed.slice(COMMAND_PREFIX.length).trim();
   return prompt || null;
+}
+
+/**
+ * Analiza si un prompt es un comando de sticker (`!sticker`, `!s`, `!sticker <texto>`).
+ * @param {string} prompt
+ * @returns {{ isSticker: boolean, text: string }}
+ */
+export function parseStickerCommand(prompt) {
+  const match = String(prompt || '').trim().match(STICKER_CMD_REGEX);
+  if (!match) return { isSticker: false, text: '' };
+  return {
+    isSticker: true,
+    text: (match[2] || '').trim(),
+  };
 }
 
 /**
@@ -303,14 +426,27 @@ async function sendBotReply(sock, remoteJid, text, quotedMsg = undefined) {
 }
 
 /**
- * Protección anti-spam para cuidar el número de WhatsApp contra ráfagas o bloqueos.
+ * Envía un sticker WebP y registra su ID para evitar bucles.
+ */
+async function sendBotSticker(sock, remoteJid, webpBuffer, quotedMsg = undefined) {
+  const options = quotedMsg ? { quoted: quotedMsg } : undefined;
+  const sent = await sock.sendMessage(remoteJid, { sticker: webpBuffer }, options);
+  trackSentMessage(sent);
+  return sent;
+}
+
+/**
+ * Protección anti-spam por usuario dentro de cada chat + límite global por minuto.
+ * Permite que varias personas en un grupo hablen al mismo tiempo sin bloquearse entre sí.
  * @param {string} remoteJid
+ * @param {string} senderId
  * @returns {boolean}
  */
-function checkRateLimit(remoteJid) {
+function checkRateLimit(remoteJid, senderId) {
   const now = Date.now();
-  const lastChatReply = lastReplyByChat.get(remoteJid) || 0;
-  if (now - lastChatReply < MIN_CHAT_INTERVAL_MS) {
+  const senderKey = `${remoteJid}::${senderId}`;
+  const lastReply = lastReplyBySender.get(senderKey) || 0;
+  if (now - lastReply < MIN_USER_INTERVAL_MS) {
     return false;
   }
 
@@ -328,14 +464,73 @@ function checkRateLimit(remoteJid) {
     return false;
   }
 
-  lastReplyByChat.set(remoteJid, now);
+  lastReplyBySender.set(senderKey, now);
   recentGlobalReplyTimestamps.push(now);
   return true;
 }
 
 /**
+ * Procesa el comando `!sticker` / `!s` (a partir de una foto directa/citada o de texto).
+ */
+async function handleStickerCommand(sock, { remoteJid, stickerText, docSource, quotedTarget }) {
+  // Caso 1: Foto adjunta o citada -> convertir a sticker WebP 512x512
+  if (docSource) {
+    if (docSource.docMsg.mediaKind !== 'image') {
+      await sendBotReply(
+        sock,
+        remoteJid,
+        'Pana, para crear stickers envíame o cita una *foto* con `!sticker` (o escribe `!sticker tu texto` para hacer uno de texto).',
+        quotedTarget
+      );
+      return;
+    }
+
+    if (docSource.docMsg.fileLength > MAX_DOCUMENT_BYTES) {
+      await sendBotReply(
+        sock,
+        remoteJid,
+        'Esa imagen es muy pesada para convertirla a sticker. Mándame una más liviana.',
+        quotedTarget
+      );
+      return;
+    }
+
+    const buffer = await downloadMediaMessage(
+      docSource.targetMsg,
+      'buffer',
+      {},
+      {
+        logger: baileysLogger,
+        reuploadRequest: sock.updateMediaMessage,
+      }
+    );
+
+    const webpBuffer = await createStickerFromImage(buffer);
+    await sendBotSticker(sock, remoteJid, webpBuffer, quotedTarget);
+    console.log(`[WhatsApp] Sticker de imagen enviado a ${maskJid(remoteJid)}.`);
+    return;
+  }
+
+  // Caso 2: Texto -> generar sticker tipográfico 512x512
+  if (stickerText) {
+    const webpBuffer = await createStickerFromText(stickerText);
+    await sendBotSticker(sock, remoteJid, webpBuffer, quotedTarget);
+    console.log(`[WhatsApp] Sticker de texto enviado a ${maskJid(remoteJid)}.`);
+    return;
+  }
+
+  // Sin foto ni texto -> mostrar ayuda breve
+  await sendBotReply(
+    sock,
+    remoteJid,
+    'Para mandar un sticker:\n• Envía o responde a una *foto* con `!sticker` (o `!s`)\n• O escribe `!sticker tu frase` para hacerlo de texto.',
+    quotedTarget
+  );
+}
+
+/**
  * Procesa mensajes entrantes y responde ÚNICAMENTE cuando el texto (o caption del archivo)
- * empieza con `!`. Soporta lectura de PDF, Word (.docx) y PowerPoint (.pptx) adjuntos o citados.
+ * empieza con `!`. Soporta multi-persona en grupos, stickers, videos, fotos y PDF/Word/PPTX.
  * @param {object} sock
  * @param {object} msg
  */
@@ -345,6 +540,11 @@ async function handleIncomingMessage(sock, msg) {
   const remoteJid = msg.key.remoteJid;
   if (shouldIgnoreJid(remoteJid)) return;
 
+  const isGroup = remoteJid.endsWith('@g.us');
+  if (isGroup) {
+    rememberGroupParticipant(msg);
+  }
+
   const rawText = extractMessageText(msg);
   if (!rawText) return;
 
@@ -353,14 +553,18 @@ async function handleIncomingMessage(sock, msg) {
   const prompt = extractTriggeredPrompt(rawText);
   if (!prompt) return;
 
-  if (!checkRateLimit(remoteJid)) return;
+  const { senderId, senderName } = resolveSenderInfo(sock, msg, isGroup);
+  if (!checkRateLimit(remoteJid, senderId)) return;
 
-  const isGroup = remoteJid.endsWith('@g.us');
   const quotedTarget = isGroup ? msg : undefined;
   const docSource = extractDocumentSource(msg);
+  const stickerCmd = parseStickerCommand(prompt);
 
   console.log(
-    `[WhatsApp] Comando ! en ${maskJid(remoteJid)}${docSource ? ' [con archivo]' : ''}: "${prompt.slice(0, 80)}"`
+    `[WhatsApp] Comando ! en ${maskJid(remoteJid)}` +
+      `${isGroup ? ` [${senderName}]` : ''}` +
+      `${docSource ? ` [${docSource.docMsg.mediaKind}]` : ''}` +
+      `: "${prompt.slice(0, 80)}"`
   );
 
   try {
@@ -375,20 +579,29 @@ async function handleIncomingMessage(sock, msg) {
       return;
     }
 
+    if (stickerCmd.isSticker) {
+      await handleStickerCommand(sock, {
+        remoteJid,
+        stickerText: stickerCmd.text,
+        docSource,
+        quotedTarget,
+      });
+      return;
+    }
+
     await sock.sendPresenceUpdate('composing', remoteJid).catch(() => {});
 
     let preparedDocument = undefined;
     if (docSource) {
-      const fileName = docSource.docMsg.fileName || 'documento';
-      const mimeType = docSource.docMsg.mimetype || '';
-      const declaredSize = Number(docSource.docMsg.fileLength || 0);
+      const { fileName, mimetype, fileLength, mediaKind } = docSource.docMsg;
+      const maxBytes = mediaKind === 'video' ? MAX_VIDEO_BYTES : MAX_DOCUMENT_BYTES;
 
-      if (declaredSize > MAX_DOCUMENT_BYTES) {
-        const maxMb = Math.round(MAX_DOCUMENT_BYTES / (1024 * 1024));
+      if (fileLength > maxBytes) {
+        const maxMb = Math.round(maxBytes / (1024 * 1024));
         await sendBotReply(
           sock,
           remoteJid,
-          `Pana, ese archivo "${fileName}" pasa de ${maxMb} MB. Mándamelo un poco más liviano para poder leerlo.`,
+          `Pana, ese archivo "${fileName}" pasa de ${maxMb} MB. Mándamelo un poco más liviano o corto para poder leerlo.`,
           quotedTarget
         );
         return;
@@ -404,11 +617,19 @@ async function handleIncomingMessage(sock, msg) {
         }
       );
 
-      preparedDocument = await prepareDocumentForGemini(buffer, { mimeType, fileName });
+      preparedDocument = await prepareDocumentForGemini(buffer, {
+        mimeType: mimetype,
+        fileName,
+      });
     }
+
+    const quotedContext = isGroup && !docSource ? extractQuotedTextContext(msg) : '';
 
     const reply = await generateReply(remoteJid, prompt, {
       document: preparedDocument,
+      isGroup,
+      senderName,
+      quotedContext,
     });
 
     await sendBotReply(sock, remoteJid, reply, quotedTarget);
@@ -456,14 +677,11 @@ export async function startWhatsApp() {
 
   activeSocket = sock;
 
-  // Número opcional para vincular con código de 8 dígitos en vez de QR (solo dígitos con código de país)
   const pairingNumber = (process.env.WHATSAPP_PAIRING_NUMBER || '').replace(/\D/g, '');
   let pairingCodeRequested = false;
 
-  // Guardar actualizaciones de credenciales (en Supabase o en auth_info/ según configuración)
   sock.ev.on('creds.update', saveCreds);
 
-  // Manejar QR, código de emparejamiento, conexión abierta y reconexión automática
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -550,7 +768,6 @@ export async function startWhatsApp() {
     }
   });
 
-  // Escuchar mensajes entrantes en tiempo real
   sock.ev.on('messages.upsert', async ({ messages, type }) => {
     if (type !== 'notify' || !Array.isArray(messages)) return;
 

@@ -1,7 +1,8 @@
 import AdmZip from 'adm-zip';
 import mammoth from 'mammoth';
 
-export const MAX_DOCUMENT_BYTES = 15 * 1024 * 1024; // 15 MB
+export const MAX_DOCUMENT_BYTES = 15 * 1024 * 1024; // 15 MB para documentos e imágenes
+export const MAX_VIDEO_BYTES = 18 * 1024 * 1024; // 18 MB para videos (límite seguro inline + RAM)
 const MAX_EXTRACTED_CHARS = 120_000;
 
 const MIME_PDF = 'application/pdf';
@@ -121,7 +122,7 @@ export async function extractDocxText(buffer) {
  * Determina el tipo lógico del archivo adjunto a partir del MIME type y la extensión.
  * @param {string} [mimeType]
  * @param {string} [fileName]
- * @returns {'image' | 'pdf' | 'docx' | 'pptx' | 'text' | 'legacy_office' | 'unsupported'}
+ * @returns {'image' | 'video' | 'pdf' | 'docx' | 'pptx' | 'text' | 'legacy_office' | 'unsupported'}
  */
 export function detectDocumentKind(mimeType = '', fileName = '') {
   const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
@@ -132,6 +133,12 @@ export function detectDocumentKind(mimeType = '', fileName = '') {
     ['jpg', 'jpeg', 'png', 'webp', 'gif'].includes(ext)
   ) {
     return 'image';
+  }
+  if (
+    mime.startsWith('video/') ||
+    ['mp4', 'mov', 'webm', 'mpeg', 'mpg', 'avi', '3gp', '3gpp'].includes(ext)
+  ) {
+    return 'video';
   }
   if (mime === MIME_PDF || ext === 'pdf') return 'pdf';
   if (mime === MIME_DOCX || ext === 'docx') return 'docx';
@@ -166,8 +173,34 @@ function resolveImageMimeType(mimeType = '', fileName = '') {
 }
 
 /**
- * Prepara un archivo o imagen descargado de WhatsApp para enviarlo a Gemini:
+ * Normaliza el MIME type de un video para enviarlo a Gemini.
+ */
+function resolveVideoMimeType(mimeType = '', fileName = '') {
+  const mime = String(mimeType || '').toLowerCase().split(';')[0].trim();
+  const supported = [
+    'video/mp4',
+    'video/mpeg',
+    'video/mpg',
+    'video/mov',
+    'video/avi',
+    'video/webm',
+    'video/3gpp',
+  ];
+  if (supported.includes(mime)) {
+    return mime;
+  }
+  if (mime === 'video/quicktime') return 'video/mov';
+  const ext = String(fileName || '').toLowerCase().split('.').pop() || '';
+  if (ext === 'webm') return 'video/webm';
+  if (ext === 'mov') return 'video/mov';
+  if (ext === '3gp' || ext === '3gpp') return 'video/3gpp';
+  return 'video/mp4';
+}
+
+/**
+ * Prepara un archivo, imagen o video descargado de WhatsApp para enviarlo a Gemini:
  * - Imagen (JPG/PNG/WEBP/GIF) -> visión multimodal nativa
+ * - Video (MP4/MOV/WEBM/3GPP) -> análisis multimodal nativo (video + audio)
  * - PDF -> envío multimodal nativo (lee texto, tablas e imágenes/gráficos)
  * - Word (.docx) -> extracción limpia de texto con mammoth
  * - PowerPoint (.pptx) -> extracción de diapositivas y notas en orden con adm-zip
@@ -177,6 +210,7 @@ function resolveImageMimeType(mimeType = '', fileName = '') {
  * @param {{ mimeType?: string, fileName?: string }} metadata
  * @returns {Promise<
  *   | { kind: 'native_image', mimeType: string, base64: string, fileName: string }
+ *   | { kind: 'native_video', mimeType: string, base64: string, fileName: string }
  *   | { kind: 'native_document', mimeType: string, base64: string, fileName: string }
  *   | { kind: 'extracted_text', format: string, text: string, fileName: string, truncated: boolean }
  * >}
@@ -186,19 +220,29 @@ export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName
     throw new UnsupportedDocumentError('El archivo llegó vacío o no se pudo descargar.');
   }
 
-  if (buffer.length > MAX_DOCUMENT_BYTES) {
-    const maxMb = Math.round(MAX_DOCUMENT_BYTES / (1024 * 1024));
+  const kind = detectDocumentKind(mimeType, fileName);
+  const maxBytes = kind === 'video' ? MAX_VIDEO_BYTES : MAX_DOCUMENT_BYTES;
+
+  if (buffer.length > maxBytes) {
+    const maxMb = Math.round(maxBytes / (1024 * 1024));
     throw new UnsupportedDocumentError(
-      `El archivo "${fileName}" pesa más de ${maxMb} MB. Envíame una versión más liviana para analizarlo.`
+      `El archivo "${fileName}" pesa más de ${maxMb} MB. Envíame una versión más liviana o corta para analizarlo.`
     );
   }
-
-  const kind = detectDocumentKind(mimeType, fileName);
 
   if (kind === 'image') {
     return {
       kind: 'native_image',
       mimeType: resolveImageMimeType(mimeType, fileName),
+      base64: buffer.toString('base64'),
+      fileName,
+    };
+  }
+
+  if (kind === 'video') {
+    return {
+      kind: 'native_video',
+      mimeType: resolveVideoMimeType(mimeType, fileName),
       base64: buffer.toString('base64'),
       fileName,
     };
@@ -269,6 +313,6 @@ export async function prepareDocumentForGemini(buffer, { mimeType = '', fileName
   }
 
   throw new UnsupportedDocumentError(
-    `Todavía no puedo leer el formato de "${fileName}". Soporto *fotos/imágenes*, *PDF*, *Word (.docx)*, *PowerPoint (.pptx)* y texto (.txt/.csv/.md).`
+    `Todavía no puedo leer el formato de "${fileName}". Soporto *fotos*, *videos*, *PDF*, *Word (.docx)*, *PowerPoint (.pptx)* y texto (.txt/.csv/.md).`
   );
 }
